@@ -1,6 +1,7 @@
 # ===============================
 # IMPORTS
 # ===============================
+import os
 import sqlite3
 import time
 from datetime import timedelta
@@ -97,8 +98,8 @@ PENDING_BROADCAST = {}
 # ===============================
 # CONFIG
 # ===============================
-BOT_TOKEN = "8583592706:AAH8yCrsLXr5dDE0O8_BMdSSfbMNoJLkv4E"
-OWNER_ID = 5942810488
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 START_IMAGE = "https://i.postimg.cc/q7PtfZYj/Untitled-design-(16).png"
 
 # ===============================

@@ -210,7 +210,7 @@ async def delete_warn_job(context: ContextTypes.DEFAULT_TYPE):
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
-    message = update.message
+    message = update.effective_message   # ✅ FIX (IMPORTANT)
     user = update.effective_user
 
     if not chat or not message or not user:
@@ -337,7 +337,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
 
-    msg = update.message
+    msg = update.effective_message   # ✅ FIX HERE
     if not msg:
         return
 
@@ -345,7 +345,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text and text.startswith("/broadcast"):
         text = text.replace("/broadcast", "", 1).strip()
 
-    # ✅ FIX: indentation only
     content = {
         "text": text,
         "photo": msg.photo[-1].file_id if msg.photo else None,
@@ -442,17 +441,19 @@ async def send_content(context, chat_id, data):
     else:
         await context.bot.send_message(chat_id, data["text"])
 
-# ===============================
-# Admin Permission + ThankYou (OPTIMIZED)
-# ===============================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.my_chat_member:
         return
 
     chat = update.effective_chat
+    if not chat:                     # ✅ FIX 1
+        return
+
     old = update.my_chat_member.old_chat_member
     new = update.my_chat_member.new_chat_member
+    if not old or not new or not new.user:   # ✅ FIX 2
+        return
 
     # ✅ FAST PATH (cache hit)
     if chat.id in BOT_ADMIN_CACHE:
@@ -655,31 +656,30 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🚨 Limit reached → mute
     if count >= LINK_LIMIT:
-        print("DEBUG: MUTE TRIGGERED", chat.id, user.id, count)  # ✅ ဒီလိုင်း
+        print("DEBUG: MUTE TRIGGERED", chat.id, user.id, count)
 
         until = now + MUTE_SECONDS
 
-        await context.bot.restrict_chat_member(
-    chat_id=chat.id,
-    user_id=user.id,
-    permissions=ChatPermissions(can_send_messages=False),
-    until_date=until
-)
-        
-        await context.bot.send_message(
-            chat.id,
-            f"🔇 <b>{user.first_name}</b> ကို\n"
-            f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
-            f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
-            parse_mode="HTML"
-        )
+    await context.bot.restrict_chat_member(
+        chat_id=chat.id,
+        user_id=user.id,
+        permissions=ChatPermissions(can_send_messages=False),
+        until_date=until
+    )
 
-        # reset counter after mute
-        job_cur.execute(
-            "DELETE FROM link_spam WHERE chat_id=? AND user_id=?",
-            (chat.id, user.id)
-        )
-        job_conn.commit()
+    await context.bot.send_message(
+        chat.id,
+        f"🔇 <b>{user.first_name}</b> ကို\n"
+        f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
+        f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
+        parse_mode="HTML"
+    )
+
+    job_cur.execute(
+        "DELETE FROM link_spam WHERE chat_id=? AND user_id=?",
+        (chat.id, user.id)
+    )
+    job_conn.commit()
 
 # ===============================
 # MAIN

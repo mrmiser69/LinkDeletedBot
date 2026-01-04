@@ -30,6 +30,7 @@ from telegram.ext import (
 BOT_ADMIN_CACHE = set()        # (chat_id) → bot admin cache
 REMINDER_MESSAGES = {}
 PENDING_BROADCAST = {}
+USER_ADMIN_CACHE = {}  # {chat_id: set(user_id)}
 
 # ===============================
 # CONFIG
@@ -208,6 +209,8 @@ async def delete_warn_job(context: ContextTypes.DEFAULT_TYPE):
 # 🔗 AUTO LINK DELETE (OPTIMIZED)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
 
     chat = update.effective_chat
     message = update.effective_message   # ✅ FIX (IMPORTANT)
@@ -236,9 +239,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===============================
     # 👤 USER ADMIN BYPASS
     # ===============================
+    if user.id in admins:
+        return
+
     try:
         member = await context.bot.get_chat_member(chat_id, user.id)
         if member.status in ("administrator", "creator"):
+            admins.add(user.id)
             return
     except:
         return
@@ -251,11 +258,12 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        # 🗑 delete link message FIRST (IMPORTANT)
+        await message.delete()
+
         # 🔗 link spam counter (mute logic)
         await link_spam_control(update, context)
 
-        # 🗑 delete link message
-        await message.delete()
 
         warn = await context.bot.send_message(
             chat_id=chat_id,
@@ -441,6 +449,9 @@ async def send_content(context, chat_id, data):
     else:
         await context.bot.send_message(chat_id, data["text"])
 
+# ===============================
+# Admin Permission + ThankYou
+# ===============================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.my_chat_member:
@@ -608,7 +619,7 @@ LINK_KEYWORDS = ("http://", "https://", "t.me/")
 async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-    message = update.message
+    message = update.effective_message
 
     if not chat or not user or not message:
         return
@@ -626,10 +637,6 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if member.status in ("administrator", "creator"):
             return
     except:
-        return
-
-    # ✅ ADD THIS
-    if chat.type != "supergroup":
         return
 
     now = int(time.time())
@@ -656,30 +663,30 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🚨 Limit reached → mute
     if count >= LINK_LIMIT:
-        print("DEBUG: MUTE TRIGGERED", chat.id, user.id, count)
-
         until = now + MUTE_SECONDS
 
-    await context.bot.restrict_chat_member(
-        chat_id=chat.id,
-        user_id=user.id,
-        permissions=ChatPermissions(can_send_messages=False),
-        until_date=until
-    )
+        await context.bot.restrict_chat_member(
+            chat_id=chat.id,
+            user_id=user.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until
+        )
 
-    await context.bot.send_message(
-        chat.id,
-        f"🔇 <b>{user.first_name}</b> ကို\n"
-        f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
-        f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
-        parse_mode="HTML"
-    )
+        await context.bot.send_message(
+            chat.id,
+            f"🔇 <b>{user.first_name}</b> ကို\n"
+            f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
+            f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
+            parse_mode="HTML"
+        )
 
-    job_cur.execute(
-        "DELETE FROM link_spam WHERE chat_id=? AND user_id=?",
-        (chat.id, user.id)
-    )
-    job_conn.commit()
+        job_cur.execute(
+            "DELETE FROM link_spam WHERE chat_id=? AND user_id=?",
+            (chat.id, user.id)
+        )
+        job_conn.commit()
+
+
 
 # ===============================
 # MAIN
@@ -689,22 +696,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
 
-    # 1️⃣ auto delete အရင်
+    # 🔗 Auto delete + spam control (combined logic)
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
             auto_delete_links
         ),
         group=0
-    )
-
-    # 2️⃣ link spam / mute နောက်
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
-            link_spam_control
-        ),
-        group=1
     )
 
     app.add_handler(
@@ -734,7 +732,7 @@ def main():
             ChatMemberHandler.MY_CHAT_MEMBER
         )
     )
-
+    
     app.post_init = restore_jobs
 
     print("🤖 Link Delete Bot running.....")

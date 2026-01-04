@@ -209,20 +209,19 @@ async def delete_warn_job(context: ContextTypes.DEFAULT_TYPE):
 # 🔗 AUTO LINK DELETE (OPTIMIZED)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
-    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
 
     chat = update.effective_chat
-    message = update.effective_message   # ✅ FIX (IMPORTANT)
+    message = update.effective_message
     user = update.effective_user
 
     if not chat or not message or not user:
         return
-
+    
     if chat.type not in ("group", "supergroup"):
         return
-
+    
     chat_id = chat.id
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
 
     # ===============================
     # 🤖 BOT ADMIN CHECK (CACHE)
@@ -256,6 +255,8 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.caption_entities:
         entities.extend(message.caption_entities)
 
+    text = (message.text or message.caption or "").lower()
+
     has_link = False
     for e in entities:
         if e.type in ("url", "text_link"):
@@ -263,14 +264,19 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if not has_link:
+        if "http://" in text or "https://" in text or "t.me/" in text:
+            has_link = True
+
+    if not has_link:
         return
 
     try:
-        # 🗑 delete link message FIRST (IMPORTANT)
+        # 🗑 delete first
         await message.delete()
 
-        # 🔗 link spam counter (mute logic)
+        # 🔗 count + mute
         await link_spam_control(update, context)
+
 
 
         warn = await context.bot.send_message(
@@ -641,6 +647,8 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.caption_entities:
         entities.extend(message.caption_entities)
 
+    text = (message.text or message.caption or "").lower()
+
     has_link = False
     for e in entities:
         if e.type in ("url", "text_link"):
@@ -648,7 +656,12 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if not has_link:
+        if "http://" in text or "https://" in text or "t.me/" in text:
+            has_link = True
+
+    if not has_link:
         return
+
 
     # Admin bypass
     try:
@@ -658,9 +671,9 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         return
 
-    # ⚠️ supergroup only (Telegram restriction)
-    if chat.type != "supergroup":
-        return
+    # ⚠️ mute is supergroup-only, but DO NOT return
+    is_supergroup = (chat.type == "supergroup")
+
 
     now = int(time.time())
 
@@ -684,8 +697,8 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job_conn.commit()
 
-    # 🚨 Limit reached → mute (FIXED INDENT)
-    if count >= LINK_LIMIT:
+    # 🚨 Limit reached → mute
+    if count >= LINK_LIMIT and is_supergroup:
         until = now + MUTE_SECONDS
 
         await context.bot.restrict_chat_member(

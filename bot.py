@@ -209,17 +209,17 @@ async def delete_warn_job(context: ContextTypes.DEFAULT_TYPE):
 # 🔗 AUTO LINK DELETE (OPTIMIZED)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
 
-    if message.text and message.text.startswith("/"):
-        return
-    
     if not chat or not message or not user:
         return
-    
+
+    # 🔥 IMPORTANT FIX
+    if message.text and message.text.startswith("/"):
+        return
+
     if chat.type not in ("group", "supergroup"):
         return
     

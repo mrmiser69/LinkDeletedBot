@@ -214,6 +214,9 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
 
+    if message.text and message.text.startswith("/"):
+        return
+    
     if not chat or not message or not user:
         return
     
@@ -738,16 +741,17 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job_conn.commit()
 
 # ===============================
-# Manual Refresh
+# /refresh (ADMIN ONLY)
 # ===============================
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
+    msg = update.effective_message
 
-    if not chat or chat.type not in ("group", "supergroup"):
+    if not chat or not user or chat.type not in ("group", "supergroup"):
         return
 
-    # admin only
+    # Admin only
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in ("administrator", "creator"):
@@ -755,23 +759,25 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         return
 
+    # 🔄 Clear caches
+    BOT_ADMIN_CACHE.discard(chat.id)
+    USER_ADMIN_CACHE.pop(chat.id, None)
+
+    # 🔁 Re-check bot admin
     try:
         me = await context.bot.get_chat_member(chat.id, context.bot.id)
         if me.status in ("administrator", "creator"):
             BOT_ADMIN_CACHE.add(chat.id)
             save_group_db(chat.id)
-
-            await update.message.reply_text(
-                "✅ Bot refreshed!\n\n"
-                "........................\n"
-                "Link delete & mute အလုပ်လုပ်နေပါပြီ။"
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Bot ကို Admin permission ပေးထားပါ။"
-            )
     except:
         pass
+
+    await msg.reply_text(
+        "🔄 <b>Refresh completed!</b>\n\n"
+        "✅ Admin cache updated\n"
+        "✅ Bot permission re-checked",
+        parse_mode="HTML"
+    )
 
 # ===============================
 # 🔄 AUTO REFRESH ADMIN CACHE ON START

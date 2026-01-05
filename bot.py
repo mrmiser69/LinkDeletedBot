@@ -271,11 +271,12 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # 🗑 delete first
+        # 🔗 spam counter (no return impact)
+        asyncio.create_task(link_spam_control(update, context))
+
+        # 🗑 delete MUST always run
         await message.delete()
 
-        # 🔗 count + mute
-        await link_spam_control(update, context)
 
 
 

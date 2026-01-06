@@ -806,6 +806,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("refresh", refresh))
 
     # 🔗 Auto delete + spam control (combined logic)
     app.add_handler(
@@ -843,8 +844,6 @@ def main():
             ChatMemberHandler.MY_CHAT_MEMBER
         )
     )
-    
-    app.add_handler(CommandHandler("refresh", refresh))
     
     async def on_startup(app):
       await restore_jobs(app)

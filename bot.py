@@ -242,8 +242,9 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # skip commands
-    if msg.text and msg.text.startswith("/"):
+    if msg.text and msg.text.startswith("/") and not msg.entities:
         return
+
 
     chat_id = chat.id
     user_id = user.id

@@ -1012,7 +1012,7 @@ def main():
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
+            filters.ChatType.GROUPS & filters.ALL,
             auto_delete_links
         ),
         group=1

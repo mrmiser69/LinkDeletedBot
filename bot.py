@@ -542,10 +542,11 @@ async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # 🔥 cleanup ONLY when leaving
-    BOT_ADMIN_CACHE.discard(chat_id)
-    USER_ADMIN_CACHE.pop(chat_id, None)
-    REMINDER_MESSAGES.pop(chat_id, None)
+    def clear_group_memory(chat_id):
+        BOT_ADMIN_CACHE.discard(chat_id)
+        USER_ADMIN_CACHE.pop(chat_id, None)
+        REMINDER_MESSAGES.pop(chat_id, None)
+
 
     try:
         await context.bot.leave_chat(chat_id)

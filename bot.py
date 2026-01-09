@@ -2,11 +2,10 @@
 # IMPORTS
 # ===============================
 import os
-import psycopg
 import time
 import asyncio
-from typing import Optional
-
+from typing import List, Dict, Optional
+import psycopg
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -26,9 +25,9 @@ from telegram.ext import (
 # ===============================
 # GLOBAL CACHES
 # ===============================
-BOT_ADMIN_CACHE = set()
-USER_ADMIN_CACHE = {}
-REMINDER_MESSAGES = {}
+BOT_ADMIN_CACHE: set[int] = set()
+USER_ADMIN_CACHE: dict[int, set[int]] = {}
+REMINDER_MESSAGES: dict[int, list[int]] = {}
 PENDING_BROADCAST = {}
 BOT_START_TIME = int(time.time())
 
@@ -46,7 +45,7 @@ DB_PASS = os.getenv("SUPABASE_PASSWORD")
 DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 
 # ===============================
-# DATABASE POOL (SAFE)
+# DATABASE (RAILWAY SAFE)
 # ===============================
 def get_conn():
     return psycopg.connect(
@@ -54,14 +53,15 @@ def get_conn():
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
-        port=int(DB_PORT),
+        port=DB_PORT,
         sslmode="require",
+        connect_timeout=5,
     )
 
 # ===============================
-# SAFE DB EXECUTOR (FIXED)
+# DB EXECUTOR (FAST + SAFE)
 # ===============================
-def db_execute(query, params=None, fetch=False):
+def db_execute(query: str, params=None, fetch: bool = False):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -71,71 +71,72 @@ def db_execute(query, params=None, fetch=False):
             conn.commit()
 
 # ===============================
-# TABLE CREATE
-# ===============================
-db_execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY
-)
-""")
-
-db_execute("""
-CREATE TABLE IF NOT EXISTS groups (
-    group_id BIGINT PRIMARY KEY
-)
-""")
-
-db_execute("""
-CREATE TABLE IF NOT EXISTS delete_jobs (
-    chat_id BIGINT,
-    message_id BIGINT,
-    run_at BIGINT
-)
-""")
-
-db_execute("""
-CREATE TABLE IF NOT EXISTS link_spam (
-    chat_id BIGINT,
-    user_id BIGINT,
-    count INT,
-    last_time BIGINT,
-    PRIMARY KEY (chat_id, user_id)
-)
-""")
-
-# ===============================
 # DB HELPERS
 # ===============================
 def save_user_db(user_id: int):
     db_execute(
         "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
-        (user_id,)
+        (user_id,),
     )
 
 def save_group_db(group_id: int):
     db_execute(
         "INSERT INTO groups (group_id) VALUES (%s) ON CONFLICT DO NOTHING",
-        (group_id,)
+        (group_id,),
     )
+
+async def init_db():
+    queries = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id BIGINT PRIMARY KEY
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS delete_jobs (
+            chat_id BIGINT,
+            message_id BIGINT,
+            run_at BIGINT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS link_spam (
+            chat_id BIGINT,
+            user_id BIGINT,
+            count INT,
+            last_time BIGINT,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """
+    ]
+
+    loop = asyncio.get_running_loop()
+    for q in queries:
+        await loop.run_in_executor(None, db_execute, q)
 
 # ===============================
 # /start (PRIVATE)
 # ===============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.message
 
-    if not update.message or not update.effective_user:
+    if not chat or chat.type != "private" or not user or not msg:
         return
 
     from html import escape
 
-    user = update.effective_user
     save_user_db(user.id)
 
-    bot = await context.bot.get_me()
-    bot_username = bot.username
+    bot = context.bot
+    bot_username = bot.username or ""
 
     user_name = escape(user.first_name or "User")
     bot_name = escape(bot.first_name or "Bot")
@@ -173,16 +174,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons.append([
         InlineKeyboardButton("👨‍💻 DEVELOPER", url="https://t.me/callmeoggy"),
-        InlineKeyboardButton("📢 CHANNEL", url="https://t.me/MMTelegramBotss")
+        InlineKeyboardButton("📢 CHANNEL", url="https://t.me/MMTelegramBotss"),
     ])
 
-    keyboard = InlineKeyboardMarkup(buttons)
-
-    await update.message.reply_photo(
+    await msg.reply_photo(
         photo=START_IMAGE,
         caption=text,
         parse_mode="HTML",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -191,17 +190,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not update.effective_chat or update.effective_chat.type != "private":
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    if (
+        not chat
+        or chat.type != "private"
+        or not user
+        or user.id != OWNER_ID
+        or not msg
+    ):
         return
 
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
-        return
+    users = db_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
+    groups = db_execute("SELECT COUNT(*) AS c FROM groups", fetch=True)
 
-    rows = db_execute("SELECT count(*) AS c FROM users", fetch=True) or []
-    user_count = rows[0]["c"] if rows else 0
-
-    rows = db_execute("SELECT count(*) AS c FROM groups", fetch=True) or []
-    group_count = rows[0]["c"] if rows else 0
+    user_count = users[0]["c"] if users else 0
+    group_count = groups[0]["c"] if groups else 0
 
     admin_groups = len(BOT_ADMIN_CACHE)
     no_admin_groups = max(0, group_count - admin_groups)
@@ -209,106 +215,105 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = int(time.time()) - BOT_START_TIME
     h, m = divmod(uptime // 60, 60)
 
-    await update.effective_message.reply_text(
+    await msg.reply_text(
         "📊 <b>Bot Statistics</b>\n\n"
         f"👤 Users: <b>{user_count}</b>\n"
         f"👥 Groups: <b>{group_count}</b>\n\n"
         f"🔐 Admin Groups: <b>{admin_groups}</b>\n"
         f"⚠️ No Admin Groups: <b>{no_admin_groups}</b>\n\n"
         f"⏱ Uptime: <b>{h}h {m}m</b>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 # ===============================
 # ⏱️ DELETE JOB CONFIG
 # ===============================
-DELETE_AFTER = 10800  # 3 hour
+DELETE_AFTER = 10800  # 3 hour (warn delete faster)
 
 # ===============================
-# 🔗 AUTO LINK DELETE (OPTIMIZED)
+# 🔗 AUTO LINK DELETE (FAST + SAFE)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    message = update.effective_message
+    msg = update.effective_message
     user = update.effective_user
 
-    if not chat or not message or not user:
+    if not chat or not msg or not user:
         return
 
-    # Skip commands
-    if message.text and message.text.startswith("/"):
+    # skip commands
+    if msg.text and msg.text.startswith("/"):
         return
 
     chat_id = chat.id
-    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    user_id = user.id
 
-    # ===============================
-    # 🤖 BOT ADMIN CHECK (CACHE)
-    # ===============================
+    # ===========================
+    # 🔗 FAST LINK DETECT
+    # ===========================
+    text = (msg.text or msg.caption or "").lower()
+    has_link = False
+
+    for e in (msg.entities or []) + (msg.caption_entities or []):
+        if e.type in ("url", "text_link"):
+            has_link = True
+            break
+
+    if not has_link and ("http://" in text or "https://" in text or "t.me/" in text):
+        has_link = True
+
+    if not has_link:
+        return
+
+    # ===========================
+    # 🤖 BOT ADMIN CHECK (CACHE FIRST)
+    # ===========================
     if chat_id not in BOT_ADMIN_CACHE:
         try:
             me = await context.bot.get_chat_member(chat_id, context.bot.id)
             if me.status not in ("administrator", "creator"):
                 return
             BOT_ADMIN_CACHE.add(chat_id)
-            save_group_db(chat_id)   # ✅ admin ဖြစ်မှ save
+            save_group_db(chat_id)
         except:
             return
 
-    # ===============================
-    # 👤 USER ADMIN BYPASS (CACHE)
-    # ===============================
-    if user.id in admins:
-        return
-
-    try:
-        member = await context.bot.get_chat_member(chat_id, user.id)
-        if member.status in ("administrator", "creator"):
-            admins.add(user.id)
+    # ===========================
+    # 👤 USER ADMIN CHECK (CACHE)
+    # ===========================
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    if user_id not in admins:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ("administrator", "creator"):
+                admins.add(user_id)
+                return
+        except:
             return
-    except:
-        return
 
-    # ==============================
-    # 🔗 Link detect
-    # ==============================
-    entities = []
-    if message.entities:
-        entities.extend(message.entities)
-    if message.caption_entities:
-        entities.extend(message.caption_entities)
-
-    text = (message.text or message.caption or "").lower()
-
-    has_link = any(e.type in ("url", "text_link") for e in entities)
-
-    if not has_link and any(x in text for x in ("http://", "https://", "t.me/")):
-        has_link = True
-
-    if not has_link:
-        return
-
-    # ==============================
-    # 🗑 DELETE + SPAM CONTROL
-    # ==============================
+    # ===========================
+    # 🗑 DELETE (INSTANT)
+    # ===========================
     try:
-        await message.delete()
+        await msg.delete()
     except:
-        return  # ❗ delete မရရင် spam count မလုပ်
+        return
 
-    await link_spam_control(update, context)
-
-    warn = await context.bot.send_message(
-        chat_id,
-        f"⚠️ ({user.first_name}) မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
-        "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။"
+    # ===========================
+    # ⚠️ SPAM CONTROL (BACKGROUND)
+    # ===========================
+    context.application.create_task(
+        link_spam_control(update, context)
     )
 
-    run_at = int(time.time()) + DELETE_AFTER
-
-    db_execute(
-        "INSERT INTO delete_jobs (chat_id, message_id, run_at) VALUES (%s,%s,%s)",
-        (chat_id, warn.message_id, run_at)
+    # ===========================
+    # ⚠️ WARN
+    # ===========================
+    warn = await context.bot.send_message(
+        chat_id,
+        f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
+        "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
+        parse_mode="HTML"
     )
 
     context.job_queue.run_once(
@@ -316,7 +321,6 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         when=DELETE_AFTER,
         data={"chat_id": chat_id, "message_id": warn.message_id}
     )
-
 
 # ===============================
 # 🔄 RESTORE JOBS ON START (OK)
@@ -430,59 +434,64 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
         return
 
-    start_time = time.time()
-
     users = db_execute("SELECT user_id FROM users", fetch=True) or []
     groups = db_execute("SELECT group_id FROM groups", fetch=True) or []
 
-    total = len(users) + len(groups)
+    targets = [u["user_id"] for u in users] + [g["group_id"] for g in groups]
+    total = len(targets)
     sent = 0
 
-    progress = await query.edit_message_text(
+    progress_msg = await query.edit_message_text(
         "📢 <b>Broadcasting...</b>\n\n⏳ Progress: 0%",
         parse_mode="HTML"
     )
 
-    async def update_progress():
-        try:
-            await safe_send(
-                progress.edit_text,
-                f"📢 <b>Broadcasting...</b>\n\n⏳ Progress: {render_progress(sent, total)}",
-                parse_mode="HTML"
+    start_time = time.time()
+
+    # 🔄 progress updater (every 2 sec)
+    async def progress_updater():
+        while sent < total:
+            try:
+                await progress_msg.edit_text(
+                    f"📢 <b>Broadcasting...</b>\n\n⏳ Progress: {render_progress(sent, total)}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+            await asyncio.sleep(2)
+
+    progress_task = asyncio.create_task(progress_updater())
+
+    # 🚀 FAST SEND (batch)
+    BATCH_SIZE = 20
+
+    for i in range(0, total, BATCH_SIZE):
+        batch = targets[i:i + BATCH_SIZE]
+
+        tasks = []
+        for chat_id in batch:
+            tasks.append(
+                safe_send(send_content, context, chat_id, data)
             )
-        except:
-            pass
 
-    # 👤 USERS
-    for row in users:
-        uid = row["user_id"]
-        try:
-            await safe_send(send_content, context, uid, data)
-        except:
-            db_execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        sent += 1
-        if sent % 30 == 0 or sent == total:
-            await update_progress()
+        for chat_id, result in zip(batch, results):
+            sent += 1
+            if isinstance(result, Exception):
+                db_execute(
+                    "DELETE FROM users WHERE user_id=%s",
+                    (chat_id,)
+                )
+                db_execute(
+                    "DELETE FROM groups WHERE group_id=%s",
+                    (chat_id,)
+                )
 
-        await asyncio.sleep(0.08)
-
-    # 👥 GROUPS
-    for row in groups:
-        gid = row["group_id"]
-        try:
-            await safe_send(send_content, context, gid, data)
-        except:
-            db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
-
-        sent += 1
-        if sent % 30 == 0 or sent == total:
-            await update_progress()
-
-        await asyncio.sleep(0.08)
+    progress_task.cancel()
 
     elapsed = int(time.time() - start_time)
-    await progress.edit_text(
+    await progress_msg.edit_text(
         "✅ <b>Broadcast Completed</b>\n\n"
         f"👤 Users: {len(users)}\n"
         f"👥 Groups: {len(groups)}\n"
@@ -526,21 +535,19 @@ async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
         if me.status in ("administrator", "creator"):
-            return  # ✅ still admin → do nothing
+            return  # ✅ still admin
     except:
         pass
 
-    def clear_group_memory(chat_id):
-        BOT_ADMIN_CACHE.discard(chat_id)
-        USER_ADMIN_CACHE.pop(chat_id, None)
-        REMINDER_MESSAGES.pop(chat_id, None)
-
+    # ✅ CLEAR MEMORY FIRST
+    BOT_ADMIN_CACHE.discard(chat_id)
+    USER_ADMIN_CACHE.pop(chat_id, None)
+    REMINDER_MESSAGES.pop(chat_id, None)
 
     try:
         await context.bot.leave_chat(chat_id)
     except:
         pass
-
 
 # ===============================
 # Helper: Clear all reminder jobs
@@ -549,7 +556,6 @@ def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     for job in context.job_queue.jobs():
         if job.data and job.data.get("chat_id") == chat_id:
             job.schedule_removal()
-
 
 # ===============================
 # Admin Permission + ThankYou
@@ -736,7 +742,6 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         (chat_id, message_id)
     )
 
-
 # ===============================
 # admin check
 # ===============================
@@ -752,8 +757,8 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
 # Link Detect + Count + Mute Code
 # ===============================
 LINK_LIMIT = 3
-MUTE_SECONDS = 600  # 10 minutes
-SPAM_RESET_SECONDS = 3600  # 1 hour reset
+MUTE_SECONDS = 600
+SPAM_RESET_SECONDS = 3600
 
 async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -763,53 +768,40 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not user or not message:
         return
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type != "supergroup":   # ⚡ mute only needs supergroup
         return
 
-    # ==============================
-    # Link detect
-    # ==============================
-    entities = []
-    if message.entities:
-        entities.extend(message.entities)
-    if message.caption_entities:
-        entities.extend(message.caption_entities)
+    chat_id = chat.id
+    user_id = user.id
 
-    text = (message.text or message.caption or "").lower()
-
-    has_link = any(e.type in ("url", "text_link") for e in entities)
-    if not has_link and ("http://" in text or "https://" in text or "t.me/" in text):
-        has_link = True
-
-    if not has_link:
+    # =========================
+    # 👤 Admin bypass (CACHE FIRST)
+    # =========================
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    if user_id in admins:
         return
 
-    # ==============================
-    # Admin bypass
-    # ==============================
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in ("administrator", "creator"):
+            admins.add(user_id)
             return
     except:
         return
 
-    is_supergroup = (chat.type == "supergroup")
+    # =========================
+    # ⚡ DB ACCESS (ONLY HERE)
+    # =========================
     now = int(time.time())
 
-    # ==============================
-    # DB fetch
-    # ==============================
     rows = db_execute(
         "SELECT count, last_time FROM link_spam WHERE chat_id=%s AND user_id=%s",
-        (chat.id, user.id),
+        (chat_id, user_id),
         fetch=True
     ) or []
 
     if rows:
         row = rows[0]
-
-        # 🔄 reset if inactive > 1 hour
         if now - row["last_time"] > SPAM_RESET_SECONDS:
             count = 1
         else:
@@ -817,34 +809,31 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         db_execute(
             "UPDATE link_spam SET count=%s, last_time=%s WHERE chat_id=%s AND user_id=%s",
-            (count, now, chat.id, user.id)
+            (count, now, chat_id, user_id)
         )
     else:
         count = 1
         db_execute(
-            "INSERT INTO link_spam (chat_id, user_id, count, last_time) VALUES (%s,%s,%s,%s)",
-            (chat.id, user.id, count, now)
+            "INSERT INTO link_spam VALUES (%s,%s,%s,%s)",
+            (chat_id, user_id, count, now)
         )
 
-    # ==============================
-    # 🚨 Limit reached → mute
-    # ==============================
-    if count >= LINK_LIMIT and is_supergroup:
+    # =========================
+    # 🚨 MUTE (INSTANT)
+    # =========================
+    if count >= LINK_LIMIT:
         until = now + MUTE_SECONDS
 
         await context.bot.restrict_chat_member(
-            chat_id=chat.id,
-            user_id=user.id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False
-            ),
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=ChatPermissions(can_send_messages=False),
             until_date=until
         )
 
         await context.bot.send_message(
-            chat.id,
-            f"🔇 <b>{user.first_name}</b> ကို\n"
+            chat_id,
+            f"🔇 <b>{user.first_name}</b>ကို\n"
             f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
             f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
             parse_mode="HTML"
@@ -852,11 +841,11 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         db_execute(
             "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
-            (chat.id, user.id)
+            (chat_id, user_id)
         )
 
 # ===============================
-# /refresh (ADMIN ONLY)
+# /refresh (ADMIN ONLY - FAST)
 # ===============================
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -866,9 +855,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not user or chat.type not in ("group", "supergroup"):
         return
 
-    save_group_db(chat.id)
-
-    # 👮 Admin only
+    # 👮 User admin check
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in ("administrator", "creator"):
@@ -880,7 +867,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     BOT_ADMIN_CACHE.discard(chat.id)
     USER_ADMIN_CACHE.pop(chat.id, None)
 
-    # 🔁 Re-check bot admin
+    # 🤖 Re-check bot admin (ONLY ONCE)
     try:
         me = await context.bot.get_chat_member(chat.id, context.bot.id)
         if me.status in ("administrator", "creator"):
@@ -897,27 +884,28 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# 🔄 AUTO REFRESH ADMIN CACHE ON START
+# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE)
 # ===============================
 async def refresh_admin_cache(app):
-    rows = db_execute(
-        "SELECT group_id FROM groups",
-        fetch=True
-    ) or []
+    rows = db_execute("SELECT group_id FROM groups", fetch=True) or []
+    added = 0
 
     for row in rows:
-        chat_id = row["group_id"]
+        gid = row["group_id"]
         try:
-            me = await app.bot.get_chat_member(chat_id, app.bot.id)
+            me = await app.bot.get_chat_member(gid, app.bot.id)
             if me.status in ("administrator", "creator"):
-                BOT_ADMIN_CACHE.add(chat_id)
+                BOT_ADMIN_CACHE.add(gid)
+                added += 1
         except:
             pass
 
-    print(f"✅ Admin cache loaded: {len(BOT_ADMIN_CACHE)}")
+        await asyncio.sleep(0.05)  # ⛔ flood protection
+
+    print(f"✅ Admin cache loaded: {added}")
 
 # ===============================
-# /refresh_all (Owner only)
+# /refresh_all (OWNER ONLY - SAFE)
 # ===============================
 async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -937,20 +925,16 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 BOT_ADMIN_CACHE.add(gid)
                 refreshed += 1
             else:
-                db_execute(
-                    "DELETE FROM groups WHERE group_id=%s",
-                    (gid,)
-                )
+                db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
                 removed += 1
         except:
-            db_execute(
-                "DELETE FROM groups WHERE group_id=%s",
-                (gid,)
-            )
+            db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
             removed += 1
 
+        await asyncio.sleep(0.05)  # ⛔ FloodWait protection
+
     await msg.reply_text(
-        f"🔄 <b>Refresh All Completed</b>\n\n"
+        "🔄 <b>Refresh All Completed</b>\n\n"
         f"✅ Active groups: {refreshed}\n"
         f"❌ Removed groups: {removed}",
         parse_mode="HTML"
@@ -991,9 +975,12 @@ def main():
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            filters.User(OWNER_ID) & filters.Regex(r"^/broadcast"),
+            filters.User(OWNER_ID)
+            & (filters.TEXT | filters.CAPTION)
+            & filters.Regex(r"^/broadcast"),
             broadcast
         )
+
     )
 
     app.add_handler(
@@ -1023,6 +1010,7 @@ def main():
     # Startup jobs
     # -------------------------------
     async def on_startup(app):
+        await init_db()
         await refresh_admin_cache(app)
         await restore_jobs(app)
 
@@ -1031,7 +1019,6 @@ def main():
 
     print("🤖 Link Delete Bot running (PRODUCTION READY)")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

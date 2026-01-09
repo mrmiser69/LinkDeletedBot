@@ -2,6 +2,7 @@
 # IMPORTS
 # ===============================
 import os
+import psycopg
 import time
 import asyncio
 from typing import Optional
@@ -21,9 +22,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-import psycopg
-from psycopg_pool import ConnectionPool
 
 # ===============================
 # GLOBAL CACHES
@@ -49,25 +47,21 @@ DB_PORT = os.getenv("SUPABASE_PORT", "5432")
 # ===============================
 # DATABASE POOL (SAFE)
 # ===============================
-pg_pool = ConnectionPool(
-    conninfo=(
-        f"host={DB_HOST} "
-        f"dbname={DB_NAME} "
-        f"user={DB_USER} "
-        f"password={DB_PASS} "
-        f"port={DB_PORT} "
-        f"sslmode=require"
-    ),
-    min_size=1,
-    max_size=10,
-    timeout=30,
-)
+def get_conn():
+    return psycopg.connect(
+        host=DB_HOST,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        port=DB_PORT,
+        sslmode="require",
+    )
 
 # ===============================
 # SAFE DB EXECUTOR (FIXED)
 # ===============================
 def db_execute(query, params=None, fetch=False):
-    with pg_pool.connection() as conn:
+    with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             if fetch:

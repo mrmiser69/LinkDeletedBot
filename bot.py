@@ -268,49 +268,44 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ===========================
-    # 👤 USER ADMIN CHECK (CACHE)
+    # 🤖 BOT ADMIN CHECK
     # ===========================
-    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
-    if user_id not in admins:
-        try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
-            if member.status in ("administrator", "creator"):
-                admins.add(user_id)
-                return
-        except:
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if me.status not in ("administrator", "creator"):
             return
-    
-    # 🤖 BOT ADMIN CHECK FIRST
-    if chat_id not in BOT_ADMIN_CACHE:
-        try:
-            me = await context.bot.get_chat_member(chat_id, context.bot.id)
-            if me.status not in ("administrator", "creator"):
-                return
-            BOT_ADMIN_CACHE.add(chat_id)
-        except:
-            return
-        
-    # 🗑 DELETE AFTER CONFIRM ADMIN
+    except:
+        return
+
+    # ===========================
+    # 👮 ADMIN / OWNER BYPASS
+    # ===========================
+    try:
+        sender = await context.bot.get_chat_member(
+            chat_id,
+            user.id if user else msg.sender_chat.id
+        )
+        if sender.status in ("administrator", "creator"):
+            return  # ❌ DO NOT DELETE ADMIN / OWNER
+    except:
+        return
+
+    # ===========================
+    # 🗑 DELETE (MEMBER ONLY)
+    # ===========================
     try:
         await msg.delete()
     except:
-        return    
-    
-    # ===========================
-    # ⚠️ SPAM CONTROL (BACKGROUND)
-    # ===========================
-    context.application.create_task(
-        link_spam_control(update, context)
-    )
-    
-    # 💾 DB save → background
-    context.application.create_task(
-        db_execute(
-            "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
-            (chat.id,)
-        )
-    )
+        return
 
+    # ===========================
+    # ⚠️ SPAM CONTROL (MEMBER ONLY)
+    # ===========================
+    if user:
+        context.application.create_task(
+            link_spam_control(update, context)
+        )
+    
     # ===========================
     # ⚠️ WARN
     # ===========================
@@ -319,6 +314,14 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
         "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
         parse_mode="HTML"
+    )
+    
+    # 💾 DB save → background
+    context.application.create_task(
+        db_execute(
+            "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
+            (chat.id,)
+        )
     )
 
     context.job_queue.run_once(

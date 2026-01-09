@@ -87,17 +87,17 @@ async def db_execute(query, params=None, fetch=False):
 # INIT DB
 # =====================================
 async def init_db():
-     db_execute("""
+     await db_execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY
         )
     """)
-     db_execute("""
+     await db_execute("""
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGINT PRIMARY KEY
         )
     """)
-     db_execute("""
+     await db_execute("""
         CREATE TABLE IF NOT EXISTS link_spam (
             chat_id BIGINT,
             user_id BIGINT,
@@ -106,7 +106,7 @@ async def init_db():
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-     db_execute("""
+     await db_execute("""
         CREATE TABLE IF NOT EXISTS delete_jobs (
             chat_id BIGINT,
             message_id BIGINT,
@@ -128,7 +128,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from html import escape
 
-    db_execute(
+    await db_execute(
         "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
         (user.id,)
     )
@@ -272,7 +272,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if me.status not in ("administrator", "creator"):
                 return
             BOT_ADMIN_CACHE.add(chat_id)
-            db_execute(
+            await db_execute(
                 "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
                 (chat.id,)
             )
@@ -479,11 +479,11 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
         for chat_id, result in zip(batch, results):
             sent += 1
             if isinstance(result, Exception):
-                db_execute(
+                await db_execute(
                     "DELETE FROM users WHERE user_id=%s",
                     (chat_id,)
                 )
-                db_execute(
+                await db_execute(
                     "DELETE FROM groups WHERE group_id=%s",
                     (chat_id,)
                 )
@@ -579,7 +579,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Save group whenever bot appears
     if new.user.id == context.bot.id:
-         db_execute(
+         await db_execute(
             "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
             (chat.id,)
         )
@@ -740,7 +740,7 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    db_execute(
+    await db_execute(
         "DELETE FROM delete_jobs WHERE chat_id=%s AND message_id=%s",
         (chat_id, message_id)
     )
@@ -810,13 +810,13 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             count = row["count"] + 1
 
-        db_execute(
+        await db_execute(
             "UPDATE link_spam SET count=%s, last_time=%s WHERE chat_id=%s AND user_id=%s",
             (count, now, chat_id, user_id)
         )
     else:
         count = 1
-        db_execute(
+        await db_execute(
             "INSERT INTO link_spam VALUES (%s,%s,%s,%s)",
             (chat_id, user_id, count, now)
         )
@@ -842,7 +842,7 @@ async def link_spam_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-        db_execute(
+        await db_execute(
             "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
             (chat_id, user_id)
         )
@@ -889,7 +889,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE)
 # ===============================
 async def refresh_admin_cache(app):
-    rows = db_execute("SELECT group_id FROM groups", fetch=True) or []
+    rows = await db_execute("SELECT group_id FROM groups", fetch=True) or []
     added = 0
 
     for row in rows:
@@ -927,10 +927,10 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 BOT_ADMIN_CACHE.add(gid)
                 refreshed += 1
             else:
-                db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
+                await db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
                 removed += 1
         except:
-            db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
+            await db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
             removed += 1
 
         await asyncio.sleep(0.05)  # ⛔ FloodWait protection

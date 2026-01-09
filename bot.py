@@ -1010,10 +1010,13 @@ def main():
     # Startup jobs
     # -------------------------------
     async def on_startup(app):
-        await init_db()
+        try:
+            await init_db()
+        except Exception as e:
+            print("⚠️ DB init failed:", e)
+
         await refresh_admin_cache(app)
         await restore_jobs(app)
-
 
     app.post_init = on_startup
 

@@ -43,7 +43,7 @@ DB_HOST = os.getenv("SUPABASE_HOST")
 DB_NAME = os.getenv("SUPABASE_DB")
 DB_USER = os.getenv("SUPABASE_USER")
 DB_PASS = os.getenv("SUPABASE_PASSWORD")
-DB_PORT = int(os.getenv("SUPABASE_PORT", "5432"))
+DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 # ===============================
 # DATABASE POOL (SAFE)
 # ===============================
@@ -53,7 +53,7 @@ def get_conn():
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
-        port=DB_PORT,
+        port=int(DB_PORT),
         sslmode="require",
     )
 

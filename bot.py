@@ -80,8 +80,7 @@ async def db_execute(query, params=None, fetch=False):
                     return [dict(zip(cols, r)) for r in cur.fetchall()]
                 conn.commit()
 
-    return await loop.run_in_executor(None, _run)
-
+    return await loop.run_in_executor(db_execute, _run)
 
 # =====================================
 # INIT DB
@@ -272,7 +271,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- LINK DETECT (STABLE)
     has_link = False
-
+    
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
             has_link = True
@@ -301,7 +300,9 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ---- COUNT + MUTE
-    await link_spam_control(chat_id, user_id, context)
+    context.application.create_task(
+        link_spam_control(chat_id, user_id, context)
+    )
 
     context.application.create_task(
         db_execute(
@@ -322,11 +323,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
 
-    rows = await db_execute(
-        "SELECT count, last_time FROM link_spam WHERE chat_id=%s AND user_id=%s",
-        (chat_id, user_id),
-        fetch=True
-    ) or []
+    try:
+        rows = await asyncio.wait_for(
+            db_execute(...),
+            timeout=2
+        )
+    except asyncio.TimeoutError:
+        return
 
     if rows:
         last = rows[0]

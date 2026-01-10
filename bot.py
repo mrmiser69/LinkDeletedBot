@@ -268,11 +268,17 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ Link detect (ALL CASES)
     has_link = False
 
+    # 🔥 Telegram preview card link (CRITICAL)
+    if msg.web_page is not None:
+        has_link = True
+
+    # entities / caption_entities
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
             has_link = True
             break
 
+    # raw text fallback
     text = (msg.text or msg.caption or "").lower()
     if "http://" in text or "https://" in text or "t.me/" in text:
         has_link = True
@@ -281,7 +287,12 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ✅ Delete
-    await msg.delete()
+    try:
+        await msg.delete()
+    except Exception as e:
+        print("❌ DELETE FAILED:", e)
+        return
+
 
     # ✅ Count + mute
     await link_spam_control(chat_id, user_id, context)
@@ -946,7 +957,7 @@ def main():
     app.add_handler(
         MessageHandler(
             (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
-            & (filters.TEXT | filters.CAPTION | filters.Entity("url")),
+            & ~filters.StatusUpdate.ALL,
             auto_delete_links
         ),
         group=0

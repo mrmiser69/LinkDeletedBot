@@ -4,19 +4,15 @@
 import os
 import time
 import asyncio
-from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
-from telegram.error import RetryAfter
-from html import escape
-import psycopg
-from psycopg_pool import ConnectionPool
 import contextlib
+from html import escape
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ChatPermissions,
 )
+from telegram.error import RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -26,6 +22,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+import psycopg
+from psycopg_pool import ConnectionPool
 
 # ===============================
 # GLOBAL CACHES
@@ -231,14 +230,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 DELETE_AFTER = 10800  # 3 hour (warn delete faster)
 
 # ===============================
-# 🔗 AUTO LINK DELETE (FAST + SAFE)
+# LINK + MUTE CONFIG
+# ===============================
+LINK_LIMIT = 3
+MUTE_SECONDS = 600
+RESET_SECONDS = 3600
+
+# ===============================
+# AUTO LINK DELETE (CORE)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     user = update.effective_user
-    
-    print("🔥 HANDLER HIT", update.effective_message.message_id)
 
     if not chat or not msg or not user:
         return
@@ -249,36 +253,31 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     user_id = user.id
 
-    # ✅ Bot admin check
-    try:
+    # ---- BOT ADMIN CHECK (CACHE FIRST)
+    if chat_id not in BOT_ADMIN_CACHE:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status not in ("administrator", "creator"):
+        if not me.can_delete_messages:
             return
-    except:
-        return
+        BOT_ADMIN_CACHE.add(chat_id)
 
-    # ✅ Admin / owner bypass
-    try:
+    # ---- ADMIN / OWNER BYPASS
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    if user_id not in admins:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in ("administrator", "creator"):
+            admins.add(user_id)
             return
-    except:
+    else:
         return
 
-    # ✅ Link detect (ALL CASES)
+    # ---- LINK DETECT (STABLE)
     has_link = False
 
-    # 🔥 Telegram preview card link (CRITICAL)
-    if msg.web_page is not None:
-        has_link = True
-
-    # entities / caption_entities
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
             has_link = True
             break
 
-    # raw text fallback
     text = (msg.text or msg.caption or "").lower()
     if "http://" in text or "https://" in text or "t.me/" in text:
         has_link = True
@@ -286,29 +285,28 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_link:
         return
 
-    # ✅ Delete
+    # ---- DELETE MESSAGE
     try:
         await msg.delete()
     except Exception as e:
-        print("❌ DELETE FAILED:", e)
+        print("DELETE FAILED:", e)
         return
 
-
-    # ✅ Count + mute
-    await link_spam_control(chat_id, user_id, context)
-
+    # ---- WARN
     warn = await context.bot.send_message(
         chat_id,
         f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
         "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
         parse_mode="HTML"
     )
-    
-    # 💾 DB save → background
+
+    # ---- COUNT + MUTE
+    await link_spam_control(chat_id, user_id, context)
+
     context.application.create_task(
         db_execute(
             "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
-            (chat.id,)
+            (chat_id,)
         )
     )
 
@@ -319,12 +317,8 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 )
 
 # ===============================
-# Link Detect + Count + Mute Code
+# LINK COUNT + MUTE
 # ===============================
-LINK_LIMIT = 3
-MUTE_SECONDS = 600
-SPAM_RESET_SECONDS = 3600
-
 async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
 
@@ -336,11 +330,7 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
 
     if rows:
         last = rows[0]
-        if now - last["last_time"] > SPAM_RESET_SECONDS:
-            count = 1
-        else:
-            count = last["count"] + 1
-
+        count = 1 if now - last["last_time"] > RESET_SECONDS else last["count"] + 1
         await db_execute(
             "UPDATE link_spam SET count=%s, last_time=%s WHERE chat_id=%s AND user_id=%s",
             (count, now, chat_id, user_id)
@@ -362,7 +352,7 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
 
         await context.bot.send_message(
             chat_id,
-            f"🔇 <b>User muted</b>ကို\n"
+            f"🔇 <b>{user_id}</b>ကို\n"
             f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
             f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
             parse_mode="HTML"
@@ -956,8 +946,7 @@ def main():
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
-            & ~filters.StatusUpdate.ALL,
+            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
             auto_delete_links
         ),
         group=0

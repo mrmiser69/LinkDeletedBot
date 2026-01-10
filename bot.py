@@ -265,6 +265,9 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ Link detect (ALL CASES)
     has_link = False
+    
+    if msg.web_page is not None:
+        has_link = True
 
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
@@ -944,7 +947,8 @@ def main():
     app.add_handler(
         MessageHandler(
             (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
-            & (filters.TEXT | filters.CAPTION),
+            & filters.ALL
+            & ~filters.StatusUpdate.ALL,
             auto_delete_links
         ),
         group=0

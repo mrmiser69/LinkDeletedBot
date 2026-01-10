@@ -289,8 +289,8 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_link and ("http://" in text or "https://" in text or "t.me/" in text):
         has_link = True
 
-    # 🔥 Telegram preview card (VERY IMPORTANT)
-    if msg.link_preview_options:
+    # 🔥 Telegram preview card (THIS WAS THE BUG)
+    if msg.web_page is not None:
         has_link = True
 
     if not has_link:

@@ -267,10 +267,6 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ Link detect (ALL CASES)
     has_link = False
-    
-    # Telegram preview link (CRITICAL)
-    if msg.web_page is not None:
-        has_link = True
 
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
@@ -950,7 +946,7 @@ def main():
     app.add_handler(
         MessageHandler(
             (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
-            & (filters.ALL & ~filters.StatusUpdate.ALL),
+            & (filters.TEXT | filters.CAPTION | filters.Entity("url")),
             auto_delete_links
         ),
         group=0
@@ -1011,4 +1007,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -6,13 +6,15 @@ import time
 import asyncio
 import contextlib
 from html import escape
+from concurrent.futures import ThreadPoolExecutor  # ✅ REQUIRED
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ChatPermissions,
 )
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, Forbidden, BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -23,8 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-import psycopg
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 
 # ===============================
 # GLOBAL CACHES
@@ -35,47 +36,77 @@ REMINDER_MESSAGES: dict[int, list[int]] = {}
 PENDING_BROADCAST = {}
 BOT_START_TIME = int(time.time())
 
-from concurrent.futures import ThreadPoolExecutor
-
-DB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
-
 # ===============================
 # CONFIG
 # ===============================
+
+# 🤖 BOT
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN missing")
+
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
 START_IMAGE = "https://i.postimg.cc/q7PtfZYj/Untitled-design-(16).png"
 
-DB_HOST = os.getenv("SUPABASE_HOST")
-DB_NAME = os.getenv("SUPABASE_DB")
-DB_USER = os.getenv("SUPABASE_USER")
-DB_PASS = os.getenv("SUPABASE_PASSWORD")
-DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
+# 🗄️ SUPABASE / POSTGRES
+DB_HOST = os.getenv("SUPABASE_HOST") or os.getenv("POSTGRES_HOST")
+DB_NAME = os.getenv("SUPABASE_DB") or os.getenv("POSTGRES_DB")
+DB_USER = os.getenv("SUPABASE_USER") or os.getenv("POSTGRES_USER")
+DB_PASS = os.getenv("SUPABASE_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
+
+DB_PORT = int(
+    os.getenv("SUPABASE_PORT")
+    or os.getenv("POSTGRES_PORT")
+    or "5432"
+)
+
+if not all([DB_HOST, DB_NAME, DB_USER, DB_PASS]):
+    raise RuntimeError("❌ Supabase DB env vars missing")
 
 # =====================================
-# DB POOL (RAILWAY SAFE)
+# DB POOL (RAILWAY + SUPABASE SAFE)
 # =====================================
-pool = ConnectionPool(
-    conninfo=(
-        f"host={DB_HOST} "
-        f"dbname={DB_NAME} "
-        f"user={DB_USER} "
-        f"password={DB_PASS} "
-        f"port={DB_PORT} "
-        f"sslmode=require"
-    ),
-    min_size=1,
-    max_size=5,
-    timeout=5,
-)
+
+pool: ConnectionPool | None = None
+
+
+def init_db_pool():
+    global pool
+
+    if pool:
+        return pool
+
+    pool = ConnectionPool(
+        conninfo=(
+            f"host={DB_HOST} "
+            f"dbname={DB_NAME} "
+            f"user={DB_USER} "
+            f"password={DB_PASS} "
+            f"port={DB_PORT} "
+            f"sslmode=require"
+        ),
+        min_size=1,
+        max_size=3,          # Railway safe
+        timeout=15,          # ⬅️ IMPORTANT
+        max_idle=300,        # prevent dead connections
+    )
+
+    return pool
 
 # =====================================
 # DB EXECUTOR (ASYNC SAFE)
 # =====================================
+from concurrent.futures import ThreadPoolExecutor
+
+DB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
 
     def _run():
+        pool = init_db_pool()  # ⬅️ CRITICAL FIX
+
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
@@ -87,35 +118,45 @@ async def db_execute(query, params=None, fetch=False):
     return await loop.run_in_executor(DB_EXECUTOR, _run)
 
 # =====================================
-# INIT DB
+# INIT DB (SAFE FOR SUPABASE)
 # =====================================
 async def init_db():
-     await db_execute("""
+    queries = [
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY
         )
-    """)
-     await db_execute("""
+        """,
+        """
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGINT PRIMARY KEY
         )
-    """)
-     await db_execute("""
+        """,
+        """
         CREATE TABLE IF NOT EXISTS link_spam (
             chat_id BIGINT,
             user_id BIGINT,
-            count INT,
-            last_time BIGINT,
+            count INT NOT NULL,
+            last_time BIGINT NOT NULL,
             PRIMARY KEY (chat_id, user_id)
         )
-    """)
-     await db_execute("""
+        """,
+        """
         CREATE TABLE IF NOT EXISTS delete_jobs (
             chat_id BIGINT,
             message_id BIGINT,
-            run_at BIGINT
+            run_at BIGINT,
+            PRIMARY KEY (chat_id, message_id)
         )
-    """)
+        """
+    ]
+
+    for q in queries:
+        try:
+            await db_execute(q)
+        except Exception as e:
+            print("⚠️ INIT_DB ERROR:", e)
+            raise
 
 # ===============================
 # /start (PRIVATE)
@@ -129,13 +170,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type != "private" or not user or not msg:
         return
 
-    # 🔥 DB save in background (NO DELAY)
-    context.application.create_task(
-        db_execute(
-            "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
-            (user.id,)
-        )
-    )
+    # ✅ SAFE DB SAVE (NON-BLOCKING + GUARDED)
+    async def save_user():
+        try:
+            await db_execute(
+                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (user.id,)
+            )
+        except Exception as e:
+            print("⚠️ START SAVE USER FAILED:", e)
+
+    context.application.create_task(save_user())
 
     bot = context.bot
     bot_username = bot.username or ""
@@ -186,7 +231,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-
 # ===============================
 # /stats (OWNER ONLY - PRIVATE)
 # ===============================
@@ -205,12 +249,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         return
 
-    users = await db_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
-    groups = await db_execute("SELECT COUNT(*) AS c FROM groups", fetch=True)
+    try:
+        users_task = db_execute(
+            "SELECT COUNT(*) AS c FROM users",
+            fetch=True
+        )
+        groups_task = db_execute(
+            "SELECT COUNT(*) AS c FROM groups",
+            fetch=True
+        )
 
-    user_count = users[0]["c"] if users else 0
-    group_count = groups[0]["c"] if groups else 0
+        users, groups = await asyncio.gather(
+            users_task,
+            groups_task,
+            return_exceptions=True
+        )
 
+        if isinstance(users, Exception):
+            print("⚠️ STATS users query failed:", users)
+            user_count = 0
+        else:
+            user_count = users[0]["c"] if users else 0
+
+        if isinstance(groups, Exception):
+            print("⚠️ STATS groups query failed:", groups)
+            group_count = 0
+        else:
+            group_count = groups[0]["c"] if groups else 0
+
+    except Exception as e:
+        print("❌ STATS FAILED:", e)
+        await msg.reply_text("❌ Stats temporarily unavailable")
+        return
+
+    # ✅ CACHE-SAFE COUNT
     admin_groups = len(BOT_ADMIN_CACHE)
     no_admin_groups = max(0, group_count - admin_groups)
 
@@ -223,7 +295,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Groups: <b>{group_count}</b>\n\n"
         f"🔐 Admin Groups: <b>{admin_groups}</b>\n"
         f"⚠️ No Admin Groups: <b>{no_admin_groups}</b>\n\n"
-        f"⏱ Uptime: <b>{h}h {m}m</b>",
+        f"⏱️ Uptime: <b>{h}h {m}m</b>",
         parse_mode="HTML",
     )
 
@@ -233,14 +305,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 DELETE_AFTER = 10800  # 3 hour (warn delete faster)
 
 # ===============================
-# LINK + MUTE CONFIG
+# schedule delete message
 # ===============================
-LINK_LIMIT = 3
-MUTE_SECONDS = 600
-RESET_SECONDS = 3600
+async def schedule_delete_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delay: int
+):
+    run_at = int(time.time()) + delay
+
+    # save to DB (for restore after restart)
+    context.application.create_task(
+        db_execute(
+            "INSERT INTO delete_jobs VALUES (%s,%s,%s)",
+            (chat_id, message_id, run_at)
+        )
+    )
+
+    context.job_queue.run_once(
+        delete_message_job,
+        when=delay,
+        data={"chat_id": chat_id, "message_id": message_id},
+        name=f"del_{chat_id}_{message_id}"
+    )
 
 # ===============================
-# AUTO LINK DELETE (CORE)
+# LINK + MUTE CONFIG
+# ===============================
+LINK_LIMIT = 3          # links before mute
+MUTE_SECONDS = 600      # 10 minutes
+SPAM_RESET_SECONDS = 3600  # 1 hour
+
+# ===============================
+# AUTO LINK DELETE (CORE) - FIXED
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -258,29 +356,36 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- BOT ADMIN CHECK (CACHE FIRST)
     if chat_id not in BOT_ADMIN_CACHE:
-        me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if not me.can_delete_messages:
+        try:
+            me = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if not me.can_delete_messages:
+                return
+            BOT_ADMIN_CACHE.add(chat_id)
+        except:
             return
-        BOT_ADMIN_CACHE.add(chat_id)
 
-    # ---- ADMIN / OWNER BYPASS
-    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
-    if user_id not in admins:
+    # ---- ADMIN / OWNER BYPASS (SAFE)
+    try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in ("administrator", "creator"):
-            admins.add(user_id)
             return
-    else:
+    except:
         return
 
-    # ---- LINK DETECT (STABLE)
+    # ---- LINK DETECT (FULL + STABLE)
     has_link = False
-    
+
+    # Telegram preview card (IMPORTANT)
+    if msg.web_page is not None:
+        has_link = True
+
+    # entities
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
             has_link = True
             break
 
+    # raw text fallback
     text = (msg.text or msg.caption or "").lower()
     if "http://" in text or "https://" in text or "t.me/" in text:
         has_link = True
@@ -288,12 +393,16 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_link:
         return
 
-    # ---- DELETE MESSAGE
+    # ---- DELETE (NEVER CRASH)
     try:
         await msg.delete()
-    except Exception as e:
-        print("DELETE FAILED:", e)
+    except:
         return
+
+    # ---- COUNT + MUTE (ONCE)
+    context.application.create_task(
+        link_spam_control(chat_id, user_id, context)
+    )
 
     # ---- WARN
     warn = await context.bot.send_message(
@@ -303,11 +412,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    # ---- COUNT + MUTE
-    context.application.create_task(
-        link_spam_control(chat_id, user_id, context)
-    )
-
+    # ---- SAVE GROUP (BG)
     context.application.create_task(
         db_execute(
             "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
@@ -315,29 +420,43 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-    context.job_queue.run_once(
-    delete_message_job,
-    when=DELETE_AFTER,
-    data={"chat_id": chat_id, "message_id": warn.message_id}
-)
+    # ---- AUTO DELETE WARN (DB + JOB)
+    await schedule_delete_message(
+        context,
+        chat_id,
+        warn.message_id,
+        DELETE_AFTER
+    )
 
 # ===============================
-# LINK COUNT + MUTE
+# LINK COUNT + MUTE (FIXED)
 # ===============================
 async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
 
+    # ---- FETCH (TIMEOUT SAFE)
     try:
         rows = await asyncio.wait_for(
-            db_execute(...),
+            db_execute(
+                "SELECT count, last_time FROM link_spam WHERE chat_id=%s AND user_id=%s",
+                (chat_id, user_id),
+                fetch=True
+            ),
             timeout=2
         )
     except asyncio.TimeoutError:
         return
+    except Exception:
+        return
 
+    # ---- COUNT LOGIC
     if rows:
         last = rows[0]
-        count = 1 if now - last["last_time"] > RESET_SECONDS else last["count"] + 1
+        if now - last["last_time"] > SPAM_RESET_SECONDS:
+            count = 1
+        else:
+            count = last["count"] + 1
+
         await db_execute(
             "UPDATE link_spam SET count=%s, last_time=%s WHERE chat_id=%s AND user_id=%s",
             (count, now, chat_id, user_id)
@@ -349,48 +468,91 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
             (chat_id, user_id, count, now)
         )
 
-    if count >= LINK_LIMIT:
+    # ---- LIMIT CHECK
+    if count < LINK_LIMIT:
+        return
+
+    # ---- MUTE ONLY IN SUPERGROUP
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        if chat.type != "supergroup":
+            return
+    except:
+        return
+
+    # ---- BOT PERMISSION CHECK
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if not me.can_restrict_members:
+            return
+    except:
+        return
+
+    # ---- MUTE
+    try:
         await context.bot.restrict_chat_member(
             chat_id,
             user_id,
             ChatPermissions(can_send_messages=False),
             until_date=now + MUTE_SECONDS
         )
+    except:
+        return
 
-        await context.bot.send_message(
-            chat_id,
-            f"🔇 <b>{user_id}</b>ကို\n"
-            f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
-            f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
-            parse_mode="HTML"
-        )
+    # ---- NOTIFY
+    await context.bot.send_message(
+        chat_id,
+        f"🔇 <b>User muted</b>\n"
+        f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
+        f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
+        parse_mode="HTML"
+    )
 
-        await db_execute(
-            "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
-            (chat_id, user_id)
-        )
+    # ---- RESET COUNTER
+    await db_execute(
+        "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
+        (chat_id, user_id)
+    )
 
 # ===============================
-# 🔄 RESTORE JOBS ON START (OK)
+# 🔄 RESTORE JOBS ON START (FIXED)
 # ===============================
 async def restore_jobs(app):
     now = int(time.time())
-    rows = await db_execute(
-        "SELECT chat_id, message_id, run_at FROM delete_jobs",
-        fetch=True
-    ) or []
+
+    try:
+        rows = await db_execute(
+            "SELECT chat_id, message_id, run_at FROM delete_jobs",
+            fetch=True
+        )
+    except Exception as e:
+        print("⚠️ restore_jobs DB error:", e)
+        return
+
+    if not rows:
+        return
 
     for row in rows:
-        delay = max(0, row["run_at"] - now)
+        run_at = row["run_at"]
+        delay = run_at - now
+
+        # ❗️ skip expired jobs (clean DB)
+        if delay <= 0:
+            await db_execute(
+                "DELETE FROM delete_jobs WHERE chat_id=%s AND message_id=%s",
+                (row["chat_id"], row["message_id"])
+            )
+            continue
+
         app.job_queue.run_once(
             delete_message_job,
             when=delay,
             data={
                 "chat_id": row["chat_id"],
                 "message_id": row["message_id"]
-            }
+            },
+            name=f"del_{row['chat_id']}_{row['message_id']}"
         )
-
 
 # ===============================
 # Save Group (ADMIN ONLY)
@@ -402,10 +564,21 @@ async def save_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         me = await context.bot.get_chat_member(chat.id, context.bot.id)
-        if me.status in ("administrator", "creator"):
-            BOT_ADMIN_CACHE.add(chat.id)
+        if me.status not in ("administrator", "creator"):
+            return
     except:
-        pass
+        return
+
+    # ✅ cache update
+    BOT_ADMIN_CACHE.add(chat.id)
+
+    # ✅ DB save (background, never block)
+    context.application.create_task(
+        db_execute(
+            "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
+            (chat.id,)
+        )
+    )
 
 # ===============================
 # Progress Bar Helper 
@@ -427,6 +600,8 @@ async def safe_send(func, *args, **kwargs):
             return await func(*args, **kwargs)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after)
+        except (Forbidden, BadRequest):
+            return None
 
 # ===============================
 # 📢 BROADCAST (OWNER ONLY)
@@ -452,11 +627,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "document": msg.document.file_id if msg.document else None,
     }
 
-    if not any(content.values()):
+    if not any(v for v in content.values() if v):
         await msg.reply_text("❌ Broadcast လုပ်ရန် content မတွေ့ပါ")
         return
 
-    PENDING_BROADCAST[msg.from_user.id] = content
+    PENDING_BROADCAST[OWNER_ID] = content
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ CONFIRM", callback_data="broadcast_confirm"),
@@ -476,7 +651,7 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
 
-    data = PENDING_BROADCAST.pop(query.from_user.id, None)
+    data = PENDING_BROADCAST.pop(OWNER_ID, None)
     if not data:
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
         return
@@ -484,7 +659,11 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
     users = await db_execute("SELECT user_id FROM users", fetch=True) or []
     groups = await db_execute("SELECT group_id FROM groups", fetch=True) or []
 
-    targets = [u["user_id"] for u in users] + [g["group_id"] for g in groups]
+    targets = list(set(
+        [u["user_id"] for u in users] +
+        [g["group_id"] for g in groups]
+    ))
+
     total = len(targets)
     sent = 0
 
@@ -495,7 +674,6 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
 
     start_time = time.time()
 
-    # 🔄 progress updater (every 2 sec)
     async def progress_updater():
         while sent < total:
             try:
@@ -509,27 +687,24 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
 
     progress_task = asyncio.create_task(progress_updater())
 
-    # 🚀 FAST SEND (batch)
-    BATCH_SIZE = 10  # Railway safe
+    BATCH_SIZE = 10
 
     for i in range(0, total, BATCH_SIZE):
         batch = targets[i:i + BATCH_SIZE]
 
-        tasks = [
-            safe_send(send_content, context, chat_id, data)
-            for chat_id in batch
-        ]
+        results = await asyncio.gather(
+            *[safe_send(send_content, context, cid, data) for cid in batch],
+            return_exceptions=True
+        )
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for chat_id, result in zip(batch, results):
+        for cid, result in zip(batch, results):
             sent += 1
             if isinstance(result, Exception):
                 context.application.create_task(
-                    db_execute("DELETE FROM users WHERE user_id=%s", (chat_id,))
+                    db_execute("DELETE FROM users WHERE user_id=%s", (cid,))
                 )
                 context.application.create_task(
-                    db_execute("DELETE FROM groups WHERE group_id=%s", (chat_id,))
+                    db_execute("DELETE FROM groups WHERE group_id=%s", (cid,))
                 )
 
     progress_task.cancel()
@@ -541,7 +716,7 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
         "✅ <b>Broadcast Completed</b>\n\n"
         f"👤 Users: {len(users)}\n"
         f"👥 Groups: {len(groups)}\n"
-        f"⏱ Time: {elapsed // 60}m {elapsed % 60}s",
+        f"⏱️ Time: {elapsed // 60}m {elapsed % 60}s",
         parse_mode="HTML"
     )
 
@@ -551,59 +726,125 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
 async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    PENDING_BROADCAST.pop(query.from_user.id, None)
+
+    PENDING_BROADCAST.pop(OWNER_ID, None)
+
     await query.edit_message_text("❌ Broadcast Cancel လုပ်လိုက်ပါပြီ")
 
 # ===============================
 # Media / Text 
 # ===============================
 async def send_content(context, chat_id, data):
-    if data["photo"]:
-        await context.bot.send_photo(chat_id, data["photo"], caption=data["text"])
-    elif data["video"]:
-        await context.bot.send_video(chat_id, data["video"], caption=data["text"])
-    elif data["audio"]:
-        await context.bot.send_audio(chat_id, data["audio"], caption=data["text"])
-    elif data["document"]:
-        await context.bot.send_document(chat_id, data["document"], caption=data["text"])
-    else:
-        await context.bot.send_message(chat_id, data["text"])
+    text = data.get("text") or ""
+
+    try:
+        if data.get("photo"):
+            await context.bot.send_photo(
+                chat_id,
+                data["photo"],
+                caption=text,
+                parse_mode="HTML"
+            )
+
+        elif data.get("video"):
+            await context.bot.send_video(
+                chat_id,
+                data["video"],
+                caption=text,
+                parse_mode="HTML"
+            )
+
+        elif data.get("audio"):
+            await context.bot.send_audio(
+                chat_id,
+                data["audio"],
+                caption=text,
+                parse_mode="HTML"
+            )
+
+        elif data.get("document"):
+            await context.bot.send_document(
+                chat_id,
+                data["document"],
+                caption=text,
+                parse_mode="HTML"
+            )
+
+        else:
+            await context.bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML"
+            )
+
+    except Exception:
+        # let caller (safe_send) + broadcast logic handle cleanup
+        raise
 
 # ===============================
-# Auto leave job
+# Auto leave job (FIXED)
 # ===============================
 async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
     if not context.job or not context.job.data:
         return
 
-    chat_id = context.job.data["chat_id"]
-
-    # ✅ CACHE FIRST (NO API CALL)
-    if chat_id in BOT_ADMIN_CACHE:
+    chat_id = context.job.data.get("chat_id")
+    if not chat_id:
         return
 
+    # 🔎 ALWAYS verify with Telegram (cache is NOT source of truth)
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if me.status in ("administrator", "creator"):
+            BOT_ADMIN_CACHE.add(chat_id)
+            return
+    except:
+        # cannot access chat → treat as removed
+        pass
+
+    # ❌ bot is NOT admin → cleanup
     BOT_ADMIN_CACHE.discard(chat_id)
     USER_ADMIN_CACHE.pop(chat_id, None)
     REMINDER_MESSAGES.pop(chat_id, None)
 
+    # 🧹 Supabase cleanup (background, non-blocking)
+    context.application.create_task(
+        db_execute("DELETE FROM groups WHERE group_id=%s", (chat_id,))
+    )
+    context.application.create_task(
+        db_execute("DELETE FROM link_spam WHERE chat_id=%s", (chat_id,))
+    )
+    context.application.create_task(
+        db_execute("DELETE FROM delete_jobs WHERE chat_id=%s", (chat_id,))
+    )
+
+    # 🚪 Leave group
     try:
         await context.bot.leave_chat(chat_id)
-    except:
-        pass
+    except Exception as e:
+        print(f"⚠️ Leave chat failed ({chat_id}):", e)
 
 # ===============================
-# Helper: Clear all reminder jobs
+# Helper: Clear all reminder jobs (FIXED)
 # ===============================
 def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    for job in context.job_queue.jobs():
-        data = job.data
-        if not data:
+    for job in list(context.job_queue.jobs()):
+        data = job.data or {}
+
+        # only reminder / auto-leave jobs
+        if data.get("chat_id") != chat_id:
             continue
-        if data.get("chat_id") == chat_id:
+
+        name = job.name or ""
+
+        if (
+            name.startswith("auto_leave_")
+            or data.get("type") == "admin_reminder"
+        ):
             job.schedule_removal()
 
 # ===============================
-# Admin Permission + ThankYou
+# Admin Permission + ThankYou (FIXED)
 # ===============================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -622,14 +863,39 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not old or not new:
         return
 
-    # Save group whenever bot appears
-    if new.user.id == context.bot.id:
+    # ===============================
+    # 🟢 BOT PROMOTED TO ADMIN
+    # ===============================
+    if (
+        new.user.id == context.bot.id
+        and new.status == "administrator"
+        and old.status != "administrator"
+    ):
+        BOT_ADMIN_CACHE.add(chat.id)
+        clear_reminders(context, chat.id)
+
         context.application.create_task(
             db_execute(
                 "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
                 (chat.id,)
             )
         )
+
+        thank = await context.bot.send_message(
+            chat.id,
+            "✅ <b>Thank you!</b>\n\n"
+            "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီ။\n"
+            "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီ..........!",
+            parse_mode="HTML"
+        )
+
+        await schedule_delete_message(
+            context,
+            chat.id,
+            thank.message_id,
+            300
+        )
+        return
 
     # ===============================
     # 🔴 BOT DEMOTED OR REMOVED
@@ -641,47 +907,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
-        
-        # cancel auto-leave
-        for job in context.job_queue.get_jobs_by_name(f"auto_leave_{chat.id}"):
-            job.schedule_removal()
 
         context.job_queue.run_once(
             leave_if_not_admin,
             when=60,
             data={"chat_id": chat.id},
             name=f"auto_leave_{chat.id}"
-        )
-        return
-
-    # ===============================
-    # 🟢 BOT PROMOTED TO ADMIN
-    # ===============================
-    if (
-        new.user.id == context.bot.id
-        and new.status == "administrator"
-        and old.status != "administrator"
-    ):
-        
-        # cancel auto-leave
-        for job in context.job_queue.get_jobs_by_name(f"auto_leave_{chat.id}"):
-            job.schedule_removal()
-        
-        BOT_ADMIN_CACHE.add(chat.id)
-        clear_reminders(context, chat.id)
-
-        thank = await context.bot.send_message(
-            chat.id,
-            "✅ <b>Thank you!</b>\n\n"
-            "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီ။\n"
-            "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီ..........!",
-            parse_mode="HTML"
-        )
-
-        context.job_queue.run_once(
-            delete_message_job,
-            when=300,
-            data={"chat_id": chat.id, "message_id": thank.message_id}
         )
         return
 
@@ -697,8 +928,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_reminders(context, chat.id)
 
         me = await context.bot.get_me()
-
-        keyboard = InlineKeyboardMarkup([[  
+        keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "⭐️ GIVE ADMIN PERMISSION",
                 url=f"https://t.me/{me.username}?startgroup=true"
@@ -720,19 +950,23 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.job_queue.run_once(
                 admin_reminder,
                 when=300 * i,
-                data={"chat_id": chat.id, "count": i, "total": 5}
+                data={
+                    "chat_id": chat.id,
+                    "count": i,
+                    "total": 5,
+                    "type": "admin_reminder"
+                }
             )
 
         context.job_queue.run_once(
             leave_if_not_admin,
-            when=300 * 5 + 10,
+            when=1510,
             data={"chat_id": chat.id},
             name=f"auto_leave_{chat.id}"
         )
 
-
 # ===============================
-# Admin Reminder
+# Admin Reminder (FIXED)
 # ===============================
 async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
 
@@ -742,22 +976,27 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     count = context.job.data["count"]
     total = context.job.data["total"]
-      
+
+    # ✅ Already admin → stop reminders
     if chat_id in BOT_ADMIN_CACHE:
         clear_reminders(context, chat_id)
         return
-   
+
     try:
+        # 🔍 check bot permission again
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
         if me.status in ("administrator", "creator"):
             BOT_ADMIN_CACHE.add(chat_id)
             clear_reminders(context, chat_id)
             return
 
+        # ✅ correct username source
+        bot = await context.bot.get_me()
+
         keyboard = InlineKeyboardMarkup([[  
             InlineKeyboardButton(
                 "⭐️ GIVE ADMIN PERMISSION",
-                url=f"https://t.me/{me.username}?startgroup=true"
+                url=f"https://t.me/{bot.username}?startgroup=true"
             )
         ]])
 
@@ -773,33 +1012,39 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
 
         REMINDER_MESSAGES.setdefault(chat_id, []).append(msg.message_id)
 
-    except:
-        pass
+    except Exception as e:
+        print(f"❌ admin_reminder error in {chat_id}:", e)
 
 # ===============================
-# delete message job
+# delete message job (FIXED)
 # ===============================
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     if not context.job or not context.job.data:
         return
 
-    chat_id = context.job.data["chat_id"]
-    message_id = context.job.data["message_id"]
+    chat_id = context.job.data.get("chat_id")
+    message_id = context.job.data.get("message_id")
+
+    if not chat_id or not message_id:
+        return
 
     try:
         await context.bot.delete_message(chat_id, message_id)
-    except:
-        pass
+    except Exception as e:
+        # message already deleted / no permission → ignore but log
+        print(f"⚠️ delete_message_job failed {chat_id}:{message_id} →", e)
 
-    context.application.create_task(
-        db_execute(
+    # 🧹 cleanup DB (ALWAYS)
+    try:
+        await db_execute(
             "DELETE FROM delete_jobs WHERE chat_id=%s AND message_id=%s",
             (chat_id, message_id)
         )
-    )
+    except Exception as e:
+        print(f"⚠️ delete_jobs DB cleanup failed:", e)
 
 # ===============================
-# admin check
+# bot admin check
 # ===============================
 async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if chat_id in BOT_ADMIN_CACHE:
@@ -815,41 +1060,70 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
 
 # ===============================
-# /refresh (ADMIN ONLY - FAST)
+# USER ADMIN CHECK
+# ===============================
+async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+
+    if user_id in admins:
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ("administrator", "creator"):
+            admins.add(user_id)
+            return True
+        return False
+    except:
+        return False
+
+# ===============================
+# /refresh (ADMIN ONLY - FAST) ✅ FIXED
 # ===============================
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     msg = update.effective_message
 
-    if not chat or not user or chat.type not in ("group", "supergroup"):
+    if not chat or not user or not msg:
         return
 
-    # 👮 User admin check
-    try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in ("administrator", "creator"):
-            return
-    except:
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = chat.id
+    user_id = user.id
+
+    # 👮 USER ADMIN CHECK (SAFE)
+    if not await is_user_admin(chat_id, user_id, context):
         return
 
     # 🔄 Clear caches
-    BOT_ADMIN_CACHE.discard(chat.id)
-    USER_ADMIN_CACHE.pop(chat.id, None)
+    BOT_ADMIN_CACHE.discard(chat_id)
+    USER_ADMIN_CACHE.pop(chat_id, None)
 
-    # 🤖 Re-check bot admin (ONLY ONCE)
+    # 🤖 Re-check bot admin (STRICT)
     try:
-        me = await context.bot.get_chat_member(chat.id, context.bot.id)
-        if me.status in ("administrator", "creator"):
-            BOT_ADMIN_CACHE.add(chat.id)
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if me.status in ("administrator", "creator") and me.can_delete_messages:
+            BOT_ADMIN_CACHE.add(chat_id)
+
             context.application.create_task(
                 db_execute(
                     "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
-                    (chat.id,)
+                    (chat_id,)
                 )
             )
+        else:
+            await msg.reply_text(
+                "⚠️ <b>Bot မှာ Delete permission မရှိပါ</b>\n\n"
+                "🔧 Admin setting ထဲမှာ\n"
+                "✅ <b>Delete Messages</b> ကို ဖွင့်ပေးပါ",
+                parse_mode="HTML"
+            )
+            return
     except:
-        pass
+        return
 
     await msg.reply_text(
         "🔄 <b>Refresh completed!</b>\n\n"
@@ -859,48 +1133,84 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE)
+# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE) ✅ FIXED
 # ===============================
 async def refresh_admin_cache(app):
     rows = await db_execute(
         "SELECT group_id FROM groups",
         fetch=True
     ) or []
-    
+
+    BOT_ADMIN_CACHE.clear()  # 🔴 IMPORTANT: clear stale cache first
     added = 0
+    removed = 0
 
     for row in rows:
         gid = row["group_id"]
         try:
             me = await app.bot.get_chat_member(gid, app.bot.id)
-            if me.status in ("administrator", "creator"):
+
+            # ✅ STRICT CHECK (THIS FIXES LINK DELETE)
+            if (
+                me.status in ("administrator", "creator")
+                and me.can_delete_messages
+            ):
                 BOT_ADMIN_CACHE.add(gid)
                 added += 1
-        except:
-            pass
+            else:
+                # ❌ no permission → remove from DB
+                app.create_task(
+                    db_execute(
+                        "DELETE FROM groups WHERE group_id=%s",
+                        (gid,)
+                    )
+                )
+                removed += 1
 
-        await asyncio.sleep(0.1)  # safer for large groups
+        except:
+            # ❌ bot removed / invalid group
+            app.create_task(
+                db_execute(
+                    "DELETE FROM groups WHERE group_id=%s",
+                    (gid,)
+                )
+            )
+            removed += 1
+
+        await asyncio.sleep(0.1)  # Railway / rate-limit safe
 
     print(f"✅ Admin cache loaded: {added}")
+    print(f"❌ Removed invalid groups: {removed}")
 
 # ===============================
-# /refresh_all (OWNER ONLY - SAFE)
+# /refresh_all (OWNER ONLY - SAFE) ✅ FIXED
 # ===============================
 async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
 
     msg = update.effective_message
-    groups = await db_execute("SELECT group_id FROM groups", fetch=True) or []
+
+    rows = await db_execute(
+        "SELECT group_id FROM groups",
+        fetch=True
+    ) or []
+
+    BOT_ADMIN_CACHE.clear()  # 🔴 IMPORTANT: reset cache first
 
     refreshed = 0
     removed = 0
 
-    for row in groups:
+    for row in rows:
         gid = row["group_id"]
         try:
             me = await context.bot.get_chat_member(gid, context.bot.id)
-            if me.status in ("administrator", "creator"):
+
+            # ✅ STRICT CHECK (MATCH RemoveHyperlinkBot)
+            if (
+                me.status in ("administrator", "creator")
+                and me.can_delete_messages
+            ):
                 BOT_ADMIN_CACHE.add(gid)
                 refreshed += 1
             else:
@@ -911,16 +1221,17 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 )
                 removed += 1
-        except:
-                context.application.create_task(
-                    db_execute(
-                        "DELETE FROM groups WHERE group_id=%s",
-                        (gid,)
-                    )
-                )
-                removed += 1
 
-        await asyncio.sleep(0.1)  
+        except:
+            context.application.create_task(
+                db_execute(
+                    "DELETE FROM groups WHERE group_id=%s",
+                    (gid,)
+                )
+            )
+            removed += 1
+
+        await asyncio.sleep(0.1)  # Railway safe
 
     await msg.reply_text(
         "🔄 <b>Refresh All Completed</b>\n\n"
@@ -930,13 +1241,9 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# MAIN
+# MAIN (FINAL FIXED)
 # ===============================
 def main():
-    
-    # ✅ FIX 1: token check BEFORE build
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -949,11 +1256,13 @@ def main():
     app.add_handler(CommandHandler("refresh_all", refresh_all))
 
     # -------------------------------
-    # Auto link delete (groups only)
+    # Auto link delete (GROUP + SUPERGROUP ONLY)
+    # ❗ StatusUpdate MUST be excluded
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
+            (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
+            & ~filters.StatusUpdate.ALL,
             auto_delete_links
         ),
         group=0
@@ -969,7 +1278,6 @@ def main():
             & filters.Regex(r"^/broadcast"),
             broadcast
         )
-
     )
 
     app.add_handler(
@@ -978,6 +1286,7 @@ def main():
             pattern="broadcast_confirm"
         )
     )
+
     app.add_handler(
         CallbackQueryHandler(
             broadcast_cancel_handler,
@@ -996,7 +1305,7 @@ def main():
     )
 
     # -------------------------------
-    # Startup jobs
+    # Startup jobs (ORDER IS CRITICAL)
     # -------------------------------
     async def on_startup(app):
         try:
@@ -1011,6 +1320,7 @@ def main():
 
     print("🤖 Link Delete Bot running (PRODUCTION READY)")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()

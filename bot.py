@@ -241,18 +241,43 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not msg or not user:
         return
 
-    # skip commands
-    if msg.text and msg.text.startswith("/"):
+    # ✅ Groups only
+    if chat.type not in ("group", "supergroup"):
         return
-
 
     chat_id = chat.id
     user_id = user.id
 
-    # ===========================
-    # 🔗 FAST LINK DETECT
-    # ===========================
-    text = (msg.text or msg.caption or "").lower()
+    # =========================
+    # 🔐 BOT ADMIN CHECK (FIRST)
+    # =========================
+    if chat_id not in BOT_ADMIN_CACHE:
+        try:
+            me = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if me.status not in ("administrator", "creator"):
+                return
+            BOT_ADMIN_CACHE.add(chat_id)
+        except:
+            return
+
+    # =========================
+    # 👮 ADMIN / OWNER BYPASS
+    # =========================
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    if user_id in admins:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ("administrator", "creator"):
+            admins.add(user_id)
+            return
+    except:
+        return
+
+    # =========================
+    # 🔗 LINK DETECTION (100%)
+    # =========================
     has_link = False
 
     for e in (msg.entities or []) + (msg.caption_entities or []):
@@ -260,51 +285,31 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             has_link = True
             break
 
+    text = (msg.text or msg.caption or "").lower()
     if not has_link and ("http://" in text or "https://" in text or "t.me/" in text):
         has_link = True
 
-    # 🔗 detect link
+    # 🔥 Telegram preview card (VERY IMPORTANT)
+    if msg.link_preview_options:
+        has_link = True
+
     if not has_link:
         return
-    
-    # ===========================
-    # 🤖 BOT ADMIN CHECK
-    # ===========================
-    try:
-        me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status not in ("administrator", "creator"):
-            return
-    except:
-        return
 
-    # ===========================
-    # 👮 ADMIN / OWNER BYPASS
-    # ===========================
-    try:
-        sender = await context.bot.get_chat_member(
-            chat_id,
-            user.id if user else msg.sender_chat.id
-        )
-        if sender.status in ("administrator", "creator"):
-            return  # ❌ DO NOT DELETE ADMIN / OWNER
-    except:
-        return
-
-    # ===========================
-    # 🗑 DELETE (MEMBER ONLY)
-    # ===========================
+    # =========================
+    # 🗑 DELETE MESSAGE
+    # =========================
     try:
         await msg.delete()
     except:
         return
 
-    # ===========================
-    # ⚠️ SPAM CONTROL (MEMBER ONLY)
-    # ===========================
-    if user:
-        context.application.create_task(
-            link_spam_control(update, context)
-        )
+    # =========================
+    # ⚠️ LINK SPAM COUNT + MUTE
+    # =========================
+    context.application.create_task(
+        link_spam_control(update, context)
+    )
     
     # ===========================
     # ⚠️ WARN

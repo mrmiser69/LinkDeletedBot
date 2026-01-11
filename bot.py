@@ -154,9 +154,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ])
 
+    # ⬇️ URL → CALLBACK (ဒီနှစ်ခုပဲ ပြောင်း)
     buttons.append([
-        InlineKeyboardButton("👨‍💻 DEVELOPER", url="https://t.me/callmeoggy"),
-        InlineKeyboardButton("📢 CHANNEL", url="https://t.me/MMTelegramBotss"),
+        InlineKeyboardButton("👨‍💻 DEVELOPER", callback_data="start_developer"),
+        InlineKeyboardButton("📢 CHANNEL", callback_data="start_channel"),
     ])
 
     await msg.reply_photo(
@@ -164,6 +165,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+# ===============================
+# Start Developer Cb
+# ===============================
+async def start_developer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "<b>👨‍💻 Developer</b>\n\n"
+        "Telegram : @callmeoggy",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="start_back")]
+        ])
+    )
+
+# ===============================
+# Start Channel Cb
+# ===============================
+async def start_channel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "<b>📢 Channel</b>\n\n"
+        "Telegram : @MMTelegramBotss",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="start_back")]
+        ])
+    )
+
+# ===============================
+# Start Back Cb
+# ===============================
+async def start_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await start(
+        Update(
+            update.update_id,
+            message=query.message
+        ),
+        context
     )
 
 # ===============================
@@ -1187,7 +1235,14 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("refresh_all", refresh_all))
-
+    
+    # -------------------------------
+    # CallBack Query
+    # -------------------------------
+    app.add_handler(CallbackQueryHandler(start_developer_cb, pattern="^start_developer$"))
+    app.add_handler(CallbackQueryHandler(start_channel_cb, pattern="^start_channel$"))
+    app.add_handler(CallbackQueryHandler(start_back_cb, pattern="^start_back$"))
+   
     # -------------------------------
     # Auto link delete (GROUP + SUPERGROUP ONLY)
     # -------------------------------

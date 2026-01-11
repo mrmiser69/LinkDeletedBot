@@ -352,7 +352,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id,
                 f"🔇 <b>{user_mention}</b>ကို\n"
-                f"🔗 Link {LINK_LIMIT} ကြိမ် ပိုလို\n"
+                f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
                 f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
                 parse_mode="HTML"
             )

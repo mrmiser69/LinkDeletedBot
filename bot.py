@@ -306,7 +306,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # LINK DETECT
     has_link = False
-    for e in (msg.entities or []) + (msg.caption_entities or []):
+    entities = []
+    if msg.entities:
+        entities.extend(msg.entities)
+    if msg.caption_entities:
+        entities.extend(msg.caption_entities)
+
+    for e in entities:
         if e.type in ("url", "text_link"):
             has_link = True
             break

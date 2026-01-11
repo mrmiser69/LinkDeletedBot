@@ -337,7 +337,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         warn = await context.bot.send_message(
             chat_id,
             f"⚠️ <b>{user_mention}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
-            "အကြောင်းပြချက်: 🔗 Link ပိုလို မရပါဘူး။",
+            "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
             parse_mode="HTML"
         )
     except:

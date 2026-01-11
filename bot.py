@@ -330,12 +330,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("❌ Delete failed:", e)
         return
-
+    
+    user_mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
     # ---- DELETE WARN
     try:
         warn = await context.bot.send_message(
             chat_id,
-            f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
+            f"⚠️ <b>{user_mention}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
             "အကြောင်းပြချက်: 🔗 Link ပိုလို မရပါဘူး။",
             parse_mode="HTML"
         )
@@ -350,7 +351,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id,
-                f"🔇 <b>{user.first_name}</b>\n"
+                f"🔇 <b>{user_mention}</b>ကို\n"
                 f"🔗 Link {LINK_LIMIT} ကြိမ် ပိုလို\n"
                 f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီ",
                 parse_mode="HTML"

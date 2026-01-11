@@ -1189,11 +1189,11 @@ def main():
 
     # -------------------------------
     # Auto link delete (GROUP + SUPERGROUP ONLY)
-    # ❗ StatusUpdate MUST be excluded
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
+            (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
+            & filters.UpdateType.EDITED_MESSAGE,
             auto_delete_links
         ),
         group=0

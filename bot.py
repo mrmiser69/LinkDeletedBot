@@ -137,7 +137,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
         "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
         "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
-        "✅ Spam Link Mute ( Link 3 ခါ ပိုရင် 10 မိနစ် Auto Mute )\n\n"
+        "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
         "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
         "➕ ငါ့ကို Group ထဲထည့်ပါ\n"

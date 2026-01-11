@@ -36,77 +36,43 @@ REMINDER_MESSAGES: dict[int, list[int]] = {}
 PENDING_BROADCAST = {}
 BOT_START_TIME = int(time.time())
 
+# 🔥 LINK SPAM CACHE (OPTION A CORE)
+LINK_SPAM_CACHE: dict[int, dict[int, tuple[int, int]]] = {}
+
 # ===============================
 # CONFIG
 # ===============================
-
-# 🤖 BOT
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN missing")
-
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-
 START_IMAGE = "https://i.postimg.cc/q7PtfZYj/Untitled-design-(16).png"
 
-# 🗄️ SUPABASE / POSTGRES
-DB_HOST = os.getenv("SUPABASE_HOST") or os.getenv("POSTGRES_HOST")
-DB_NAME = os.getenv("SUPABASE_DB") or os.getenv("POSTGRES_DB")
-DB_USER = os.getenv("SUPABASE_USER") or os.getenv("POSTGRES_USER")
-DB_PASS = os.getenv("SUPABASE_PASSWORD") or os.getenv("POSTGRES_PASSWORD")
+DB_HOST = os.getenv("SUPABASE_HOST")
+DB_NAME = os.getenv("SUPABASE_DB")
+DB_USER = os.getenv("SUPABASE_USER")
+DB_PASS = os.getenv("SUPABASE_PASSWORD")
+DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 
-DB_PORT = int(
-    os.getenv("SUPABASE_PORT")
-    or os.getenv("POSTGRES_PORT")
-    or "5432"
+# ===============================
+# DB POOL (SAFE – NON BLOCKING CORE)
+# ===============================
+pool = ConnectionPool(
+    conninfo=(
+        f"host={DB_HOST} "
+        f"dbname={DB_NAME} "
+        f"user={DB_USER} "
+        f"password={DB_PASS} "
+        f"port={DB_PORT} "
+        f"sslmode=require"
+    ),
+    min_size=1,
+    max_size=5,
+    timeout=5,
 )
-
-if not all([DB_HOST, DB_NAME, DB_USER, DB_PASS]):
-    raise RuntimeError("❌ Supabase DB env vars missing")
-
-# =====================================
-# DB POOL (RAILWAY + SUPABASE SAFE)
-# =====================================
-
-pool: ConnectionPool | None = None
-
-
-def init_db_pool():
-    global pool
-
-    if pool:
-        return pool
-
-    pool = ConnectionPool(
-        conninfo=(
-            f"host={DB_HOST} "
-            f"dbname={DB_NAME} "
-            f"user={DB_USER} "
-            f"password={DB_PASS} "
-            f"port={DB_PORT} "
-            f"sslmode=require"
-        ),
-        min_size=1,
-        max_size=3,          # Railway safe
-        timeout=15,          # ⬅️ IMPORTANT
-        max_idle=300,        # prevent dead connections
-    )
-
-    return pool
-
-# =====================================
-# DB EXECUTOR (ASYNC SAFE)
-# =====================================
-from concurrent.futures import ThreadPoolExecutor
-
-DB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
 
     def _run():
-        pool = init_db_pool()  # ⬅️ CRITICAL FIX
-
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
@@ -115,54 +81,27 @@ async def db_execute(query, params=None, fetch=False):
                     return [dict(zip(cols, r)) for r in cur.fetchall()]
                 conn.commit()
 
-    return await loop.run_in_executor(DB_EXECUTOR, _run)
+    return await loop.run_in_executor(None, _run)
 
-# =====================================
-# INIT DB (SAFE FOR SUPABASE)
-# =====================================
+# ===============================
+# INIT DB
+# ===============================
 async def init_db():
-    queries = [
-        """
+    await db_execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY
         )
-        """,
-        """
+    """)
+    await db_execute("""
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGINT PRIMARY KEY
         )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS link_spam (
-            chat_id BIGINT,
-            user_id BIGINT,
-            count INT NOT NULL,
-            last_time BIGINT NOT NULL,
-            PRIMARY KEY (chat_id, user_id)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS delete_jobs (
-            chat_id BIGINT,
-            message_id BIGINT,
-            run_at BIGINT,
-            PRIMARY KEY (chat_id, message_id)
-        )
-        """
-    ]
-
-    for q in queries:
-        try:
-            await db_execute(q)
-        except Exception as e:
-            print("⚠️ INIT_DB ERROR:", e)
-            raise
+    """)
 
 # ===============================
 # /start (PRIVATE)
 # ===============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat = update.effective_chat
     user = update.effective_user
     msg = update.message
@@ -170,17 +109,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type != "private" or not user or not msg:
         return
 
-    # ✅ SAFE DB SAVE (NON-BLOCKING + GUARDED)
-    async def save_user():
-        try:
-            await db_execute(
-                "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                (user.id,)
-            )
-        except Exception as e:
-            print("⚠️ START SAVE USER FAILED:", e)
-
-    context.application.create_task(save_user())
+    context.application.create_task(
+        db_execute(
+            "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
+            (user.id,)
+        )
+    )
 
     bot = context.bot
     bot_username = bot.username or ""
@@ -338,7 +272,7 @@ MUTE_SECONDS = 600      # 10 minutes
 SPAM_RESET_SECONDS = 3600  # 1 hour
 
 # ===============================
-# AUTO LINK DELETE (CORE) - FIXED
+# AUTO LINK DELETE (OPTION A CORE)
 # ===============================
 async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -354,38 +288,30 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     user_id = user.id
 
-    # ---- BOT ADMIN CHECK (CACHE FIRST)
+    # BOT ADMIN CHECK
     if chat_id not in BOT_ADMIN_CACHE:
-        try:
-            me = await context.bot.get_chat_member(chat_id, context.bot.id)
-            if not me.can_delete_messages:
-                return
-            BOT_ADMIN_CACHE.add(chat_id)
-        except:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if not me.can_delete_messages:
             return
+        BOT_ADMIN_CACHE.add(chat_id)
 
-    # ---- ADMIN / OWNER BYPASS (SAFE)
-    try:
+    # ADMIN BYPASS
+    admins = USER_ADMIN_CACHE.setdefault(chat_id, set())
+    if user_id not in admins:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status in ("administrator", "creator"):
+            admins.add(user_id)
             return
-    except:
+    else:
         return
 
-    # ---- LINK DETECT (FULL + STABLE)
+    # LINK DETECT
     has_link = False
-
-    # Telegram preview card (IMPORTANT)
-    if msg.web_page is not None:
-        has_link = True
-
-    # entities
     for e in (msg.entities or []) + (msg.caption_entities or []):
         if e.type in ("url", "text_link"):
             has_link = True
             break
 
-    # raw text fallback
     text = (msg.text or msg.caption or "").lower()
     if "http://" in text or "https://" in text or "t.me/" in text:
         has_link = True
@@ -393,20 +319,37 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_link:
         return
 
-    # ---- DELETE (NEVER CRASH)
-    try:
-        await msg.delete()
-    except:
-        return
+    # 🔥 DELETE FIRST (NO DB, NO BLOCK)
+    await msg.delete()
 
-    # ---- WARN
-    try:
-        warn = await context.bot.send_message(
+    # WARN
+    warn = await context.bot.send_message(
+        chat_id,
+        f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
+        "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
+        parse_mode="HTML"
+    )
+
+    # COUNT + MUTE
+    now = int(time.time())
+    user_cache = LINK_SPAM_CACHE.setdefault(chat_id, {})
+    count, last = user_cache.get(user_id, (0, 0))
+
+    if now - last > SPAM_RESET_SECONDS:
+        count = 1
+    else:
+        count += 1
+
+    user_cache[user_id] = (count, now)
+
+    if count >= LINK_LIMIT and chat.type == "supergroup":
+        await context.bot.restrict_chat_member(
             chat_id,
-            f"⚠️ <b>{user.first_name}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီ။\n"
-            "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
-            parse_mode="HTML"
+            user_id,
+            ChatPermissions(can_send_messages=False),
+            until_date=now + MUTE_SECONDS
         )
+        user_cache.pop(user_id, None)
 
     # ---- AUTO DELETE WARN (DB + JOB)
         await schedule_delete_message(
@@ -415,8 +358,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warn.message_id,
             DELETE_AFTER
         )
-    except:
-        pass  
+
 # ===============================
 # LINK COUNT + MUTE (FIXED)
 # ===============================
@@ -1233,7 +1175,9 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN (FINAL FIXED)
 # ===============================
 def main():
-
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN missing")
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # -------------------------------
@@ -1250,8 +1194,7 @@ def main():
     # -------------------------------
     app.add_handler(
         MessageHandler(
-            (filters.TEXT | filters.CAPTION | filters.Entity("url"))
-            & filters.ChatType.GROUPS,
+            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
             auto_delete_links
         ),
         group=0

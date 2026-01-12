@@ -1073,7 +1073,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE) ✅ FIXED
+# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE) ✅ FINAL FIX
 # ===============================
 async def refresh_admin_cache(app):
     rows = await db_execute(
@@ -1081,16 +1081,17 @@ async def refresh_admin_cache(app):
         fetch=True
     ) or []
 
-    BOT_ADMIN_CACHE.clear()  # 🔴 IMPORTANT: clear stale cache first
+    BOT_ADMIN_CACHE.clear()  # clear stale cache
     added = 0
     removed = 0
 
     for row in rows:
         gid = row["group_id"]
+
         try:
             me = await app.bot.get_chat_member(gid, app.bot.id)
 
-            # ✅ STRICT CHECK (THIS FIXES LINK DELETE)
+            # ✅ STRICT CHECK
             if (
                 me.status in ("administrator", "creator")
                 and me.can_delete_messages
@@ -1098,26 +1099,22 @@ async def refresh_admin_cache(app):
                 BOT_ADMIN_CACHE.add(gid)
                 added += 1
             else:
-                # ❌ no permission → remove from DB
-                app.create_task(
-                    db_execute(
-                        "DELETE FROM groups WHERE group_id=%s",
-                        (gid,)
-                    )
-                )
-                removed += 1
-
-        except:
-            # ❌ bot removed / invalid group
-            app.create_task(
-                db_execute(
+                # ❌ no permission → remove from DB (AWAIT, not create_task)
+                await db_execute(
                     "DELETE FROM groups WHERE group_id=%s",
                     (gid,)
                 )
+                removed += 1
+
+        except Exception:
+            # ❌ bot removed / invalid group
+            await db_execute(
+                "DELETE FROM groups WHERE group_id=%s",
+                (gid,)
             )
             removed += 1
 
-        await asyncio.sleep(0.1)  # Railway / rate-limit safe
+        await asyncio.sleep(0.1)  # rate-limit safe
 
     print(f"✅ Admin cache loaded: {added}")
     print(f"❌ Removed invalid groups: {removed}")

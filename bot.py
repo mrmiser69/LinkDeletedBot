@@ -784,7 +784,7 @@ def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             job.schedule_removal()
 
 # ===============================
-# Admin Permission + ThankYou (FIXED)
+# Admin Permission + ThankYou (SAFE FIX)
 # ===============================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -795,7 +795,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat:
         return
 
-    # reset cached user-admins on any change
     USER_ADMIN_CACHE.pop(chat.id, None)
 
     old = update.my_chat_member.old_chat_member
@@ -803,25 +802,23 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not old or not new:
         return
 
+    bot_id = context.bot.id
+
     # ===============================
     # 🟢 BOT PROMOTED TO ADMIN
     # ===============================
     if (
-        new.user.id == context.bot.id
+        new.user.id == bot_id
         and new.status == "administrator"
         and old.status != "administrator"
     ):
         BOT_ADMIN_CACHE.add(chat.id)
         clear_reminders(context, chat.id)
 
-        # 🔥 DELETE ADMIN REQUEST MESSAGES
-        if chat.id in REMINDER_MESSAGES:
-            for mid in REMINDER_MESSAGES[chat.id]:
-                try:
-                    await context.bot.delete_message(chat.id, mid)
-                except:
-                    pass
-            REMINDER_MESSAGES.pop(chat.id, None)
+        # 🔥 delete admin request messages
+        for mid in REMINDER_MESSAGES.pop(chat.id, []):
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat.id, mid)
 
         context.application.create_task(
             db_execute(
@@ -830,89 +827,101 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-        thank = await context.bot.send_message(
-            chat.id,
-            "✅ <b>Thank you!</b>\n\n"
-            "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီ။\n"
-            "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီ..........!",
-            parse_mode="HTML"
-        )
+        try:
+            thank = await context.bot.send_message(
+                chat.id,
+                "✅ <b>Thank you!</b>\n\n"
+                "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n"
+                "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီ..........!",
+                parse_mode="HTML"
+            )
 
-        await schedule_delete_message(
-            context,
-            chat.id,
-            thank.message_id,
-            300
-        )
+            # schedule delete (only if job_queue exists)
+            if context.job_queue:
+                await schedule_delete_message(
+                    context,
+                    chat.id,
+                    thank.message_id,
+                    300
+                )
+        except:
+            pass
+
         return
 
     # ===============================
     # 🔴 BOT DEMOTED OR REMOVED
     # ===============================
     if (
-        old.user.id == context.bot.id
+        old.user.id == bot_id
         and old.status in ("administrator", "creator")
-        and new.status == "member"
+        and new.status in ("member", "left", "kicked")
     ):
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
 
-        context.job_queue.run_once(
-            leave_if_not_admin,
-            when=60,
-            data={"chat_id": chat.id},
-            name=f"auto_leave_{chat.id}"
-        )
+        if context.job_queue:
+            context.job_queue.run_once(
+                leave_if_not_admin,
+                when=60,
+                data={"chat_id": chat.id},
+                name=f"auto_leave_{chat.id}"
+            )
         return
 
     # ===============================
     # 🟡 BOT ADDED BUT NOT ADMIN
     # ===============================
     if (
-        new.user.id == context.bot.id
+        new.user.id == bot_id
         and new.status == "member"
         and old.status in ("left", "kicked")
     ):
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
 
-        me = await context.bot.get_me()
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "⭐️ GIVE ADMIN PERMISSION",
-                url=f"https://t.me/{me.username}?startgroup=true"
-            )
-        ]])
+        try:
+            me = await context.bot.get_me()
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⭐️ GIVE ADMIN PERMISSION",
+                    url=f"https://t.me/{me.username}?startgroup=true"
+                )
+            ]])
 
-        msg = await context.bot.send_message(
-            chat.id,
-            "⚠️ <b>Admin Permission Required</b>\n\n"
-            "🤖 Bot ကို အလုပ်လုပ်နိုင်ရန်\n"
-            "⭐️ <b>Admin အဖြစ် ခန့်ထားပေးပါ</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-
-        REMINDER_MESSAGES.setdefault(chat.id, []).append(msg.message_id)
-
-        for i in range(1, 6):
-            context.job_queue.run_once(
-                admin_reminder,
-                when=300 * i,
-                data={
-                    "chat_id": chat.id,
-                    "count": i,
-                    "total": 5,
-                    "type": "admin_reminder"
-                }
+            msg = await context.bot.send_message(
+                chat.id,
+                "⚠️ <b>Admin Permission Required</b>\n\n"
+                "🤖 Bot ကို အလုပ်လုပ်နိုင်ရန်\n"
+                "⭐️ <b>Admin အဖြစ် ခန့်ထားပေးပါ</b>",
+                parse_mode="HTML",
+                reply_markup=keyboard
             )
 
-        context.job_queue.run_once(
-            leave_if_not_admin,
-            when=1510,
-            data={"chat_id": chat.id},
-            name=f"auto_leave_{chat.id}"
-        )
+            REMINDER_MESSAGES.setdefault(chat.id, []).append(msg.message_id)
+
+            if context.job_queue:
+                for i in range(1, 6):
+                    context.job_queue.run_once(
+                        admin_reminder,
+                        when=300 * i,
+                        data={
+                            "chat_id": chat.id,
+                            "count": i,
+                            "total": 5,
+                            "type": "admin_reminder"
+                        }
+                    )
+
+                context.job_queue.run_once(
+                    leave_if_not_admin,
+                    when=1510,
+                    data={"chat_id": chat.id},
+                    name=f"auto_leave_{chat.id}"
+                )
+        except:
+            pass
+
 
 # ===============================
 # Admin Reminder (FIXED)

@@ -1117,7 +1117,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE) ✅ FINAL FIX
+# 🔄 AUTO REFRESH ADMIN CACHE ON START (SAFE)
 # ===============================
 async def refresh_admin_cache(app):
     rows = await db_execute(
@@ -1125,9 +1125,9 @@ async def refresh_admin_cache(app):
         fetch=True
     ) or []
 
-    BOT_ADMIN_CACHE.clear()  # clear stale cache
-    added = 0
-    removed = 0
+    BOT_ADMIN_CACHE.clear()
+    verified = 0
+    skipped = 0
 
     for row in rows:
         gid = row["group_id"]
@@ -1135,36 +1135,27 @@ async def refresh_admin_cache(app):
         try:
             me = await app.bot.get_chat_member(gid, app.bot.id)
 
-            # ✅ STRICT CHECK
-            if (
-                me.status in ("administrator", "creator")
-                and me.can_delete_messages
-            ):
+            # ✅ Admin ဖြစ်ရင် cache ထဲထည့်
+            if me.status in ("administrator", "creator"):
                 BOT_ADMIN_CACHE.add(gid)
-                added += 1
+                verified += 1
             else:
-                # ❌ no permission → remove from DB (AWAIT, not create_task)
-                await db_execute(
-                    "DELETE FROM groups WHERE group_id=%s",
-                    (gid,)
-                )
-                removed += 1
+                # ❌ NOT ADMIN → cache မထည့်ပဲ skip
+                skipped += 1
 
-        except Exception:
-            # ❌ bot removed / invalid group
-            await db_execute(
-                "DELETE FROM groups WHERE group_id=%s",
-                (gid,)
-            )
-            removed += 1
+        except Exception as e:
+            # ❗ API error / private group / rate limit
+            # ❌ DB မဖျက် ❌
+            print(f"⚠️ Skip admin check for {gid}: {e}")
+            skipped += 1
 
         await asyncio.sleep(0.1)  # rate-limit safe
 
-    print(f"✅ Admin cache loaded: {added}")
-    print(f"❌ Removed invalid groups: {removed}")
+    print(f"✅ Admin cache verified: {verified}")
+    print(f"⚠️ Skipped (kept in DB): {skipped}")
 
 # ===============================
-# /refresh_all (OWNER ONLY - SAFE) ✅ FIXED
+# /refresh_all (OWNER ONLY - SAFE)
 # ===============================
 async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -1177,47 +1168,37 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fetch=True
     ) or []
 
-    BOT_ADMIN_CACHE.clear()  # 🔴 IMPORTANT: reset cache first
+    BOT_ADMIN_CACHE.clear()  # reset cache only
 
-    refreshed = 0
-    removed = 0
+    verified = 0
+    skipped = 0
 
     for row in rows:
         gid = row["group_id"]
+
         try:
             me = await context.bot.get_chat_member(gid, context.bot.id)
 
-            # ✅ STRICT CHECK (MATCH RemoveHyperlinkBot)
-            if (
-                me.status in ("administrator", "creator")
-                and me.can_delete_messages
-            ):
+            # ✅ Admin ဖြစ်ရင် cache ထဲထည့်
+            if me.status in ("administrator", "creator"):
                 BOT_ADMIN_CACHE.add(gid)
-                refreshed += 1
+                verified += 1
             else:
-                context.application.create_task(
-                    db_execute(
-                        "DELETE FROM groups WHERE group_id=%s",
-                        (gid,)
-                    )
-                )
-                removed += 1
+                # ❌ Not admin → skip only (NO DB DELETE)
+                skipped += 1
 
-        except:
-            context.application.create_task(
-                db_execute(
-                    "DELETE FROM groups WHERE group_id=%s",
-                    (gid,)
-                )
-            )
-            removed += 1
+        except Exception as e:
+            # ❗ API error / bot can’t access group
+            # ❌ DB မဖျက်
+            print(f"⚠️ refresh_all skip {gid}: {e}")
+            skipped += 1
 
-        await asyncio.sleep(0.1)  # Railway safe
+        await asyncio.sleep(0.1)  # rate-limit safe
 
     await msg.reply_text(
         "🔄 <b>Refresh All Completed</b>\n\n"
-        f"✅ Active groups: {refreshed}\n"
-        f"❌ Removed groups: {removed}",
+        f"✅ Verified admin groups: {verified}\n"
+        f"⚠️ Skipped (kept in DB): {skipped}",
         parse_mode="HTML"
     )
 

@@ -1256,6 +1256,15 @@ def main():
     # -------------------------------
     # Broadcast (OWNER ONLY)
     # -------------------------------
+    app.add_handler(
+        MessageHandler(
+            filters.User(OWNER_ID)
+            & (filters.TEXT | filters.CAPTION)
+            & filters.Regex(r"^/broadcast"),
+            broadcast
+        )
+    )
+
     app.add_handler(CallbackQueryHandler(
         broadcast_confirm_handler,
         pattern="broadcast_confirm"
@@ -1270,16 +1279,6 @@ def main():
         broadcast_cancel_handler,
         pattern="broadcast_cancel"
     ))
-
-    # -------------------------------
-    # Bot admin / permission tracking
-    # -------------------------------
-    app.add_handler(
-        ChatMemberHandler(
-            on_my_chat_member,
-            ChatMemberHandler.MY_CHAT_MEMBER
-        )
-    )
 
     # -------------------------------
     # Startup jobs (ORDER IS CRITICAL)

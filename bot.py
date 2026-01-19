@@ -614,7 +614,7 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
         return
 
-    target_type = query.data  # bc_target_users / groups / all
+    target_type = query.data  # bc_target_users / bc_target_groups / bc_target_all
 
     users = await db_execute("SELECT user_id FROM users", fetch=True) or []
     groups = await db_execute("SELECT group_id FROM groups", fetch=True) or []
@@ -663,13 +663,9 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
 
         for cid, result in zip(batch, results):
             sent += 1
+            # ❌ DB delete logic REMOVED
             if result is None or isinstance(result, Exception):
-                context.application.create_task(
-                    db_execute("DELETE FROM users WHERE user_id=%s", (cid,))
-                )
-                context.application.create_task(
-                    db_execute("DELETE FROM groups WHERE group_id=%s", (cid,))
-                )
+                pass   # error ဖြစ်ရင် ignore only
 
     progress_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):

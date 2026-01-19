@@ -1178,7 +1178,7 @@ async def refresh_admin_cache(app):
     print(f"⚠️ Skipped (kept in DB): {skipped}")
 
 # ===============================
-# /refresh_all (OWNER ONLY - CLEAN ADMIN GROUPS)
+# /refresh_all (OWNER ONLY - FINAL SAFE VERSION)
 # ===============================
 async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -1193,8 +1193,9 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     BOT_ADMIN_CACHE.clear()
 
-    verified_groups = []
-    removed = 0
+    verified = 0
+    skipped = 0
+    failed = 0
 
     for row in rows:
         gid = row["group_id"]
@@ -1202,33 +1203,27 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             me = await context.bot.get_chat_member(gid, context.bot.id)
 
+            # ✅ Bot admin ဖြစ်ရင် cache ထဲထည့်
             if me.status in ("administrator", "creator"):
                 BOT_ADMIN_CACHE.add(gid)
-                verified_groups.append(gid)
+                verified += 1
             else:
-                removed += 1
+                skipped += 1
 
         except Exception as e:
+            # ❗ API error / private group / rate limit
+            # ❌ DB မဖျက် ❌
             print(f"⚠️ refresh_all skip {gid}: {e}")
-            removed += 1
+            failed += 1
 
-        await asyncio.sleep(0.1)
-
-    # 🔥 DB = ADMIN GROUPS ONLY
-    await db_execute("DELETE FROM groups")
-
-    if verified_groups:
-        values = ",".join(["(%s)"] * len(verified_groups))
-        query = f"""
-            INSERT INTO groups (group_id)
-            VALUES {values}
-        """
-        await db_execute(query, tuple(verified_groups))
+        await asyncio.sleep(0.1)  # rate-limit safe
 
     await msg.reply_text(
-        "🔄 <b>Refresh All Completed</b>\n\n"
-        f"✅ Admin groups saved: {len(verified_groups)}\n"
-        f"🗑️ Removed non-admin groups: {removed}",
+        "🔄 <b>Refresh All Completed (SAFE)</b>\n\n"
+        f"✅ Admin groups (active): {verified}\n"
+        f"⚠️ Non-admin groups (kept): {skipped}\n"
+        f"❗ API skipped: {failed}\n\n"
+        "🛡️ <i>DB was NOT modified</i>",
         parse_mode="HTML"
     )
 

@@ -14,14 +14,12 @@ from telegram import (
     InlineKeyboardButton,
     ChatPermissions,
 )
-from telegram.error import BadRequest
 from telegram.error import RetryAfter, Forbidden, BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -96,9 +94,28 @@ async def init_db():
             user_id BIGINT PRIMARY KEY
         )
     """)
+
     await db_execute("""
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGINT PRIMARY KEY
+        )
+    """)
+
+    await db_execute("""
+        CREATE TABLE IF NOT EXISTS delete_jobs (
+            chat_id BIGINT,
+            message_id BIGINT,
+            run_at BIGINT
+        )
+    """)
+
+    await db_execute("""
+        CREATE TABLE IF NOT EXISTS link_spam (
+            chat_id BIGINT,
+            user_id BIGINT,
+            count INT,
+            last_time BIGINT,
+            PRIMARY KEY (chat_id, user_id)
         )
     """)
 
@@ -295,7 +312,10 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     except:
         return
-
+    
+    # ✅ cache update (safe)
+    BOT_ADMIN_CACHE.add(chat_id)
+    
     # ADMIN BYPASS
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
@@ -307,6 +327,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # LINK DETECT
     has_link = False
     entities = []
+
     if msg.entities:
         entities.extend(msg.entities)
     if msg.caption_entities:
@@ -335,6 +356,7 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+    
     # ---- DELETE WARN
     try:
         warn = await context.bot.send_message(
@@ -361,11 +383,12 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except:
             pass
-
-    # ---- SAVE GROUP
+    
+    # 💾 DB SAVE (ADMIN ONLY – SAFE)
+    
     context.application.create_task(
         db_execute(
-            "INSERT INTO groups VALUES (%s) ON CONFLICT DO NOTHING",
+            "INSERT INTO groups (group_id) VALUES (%s) ON CONFLICT DO NOTHING",
             (chat_id,)
         )
     )
@@ -1155,7 +1178,7 @@ async def refresh_admin_cache(app):
     print(f"⚠️ Skipped (kept in DB): {skipped}")
 
 # ===============================
-# /refresh_all (OWNER ONLY - SAVE ADMIN GROUPS)
+# /refresh_all (OWNER ONLY - CLEAN ADMIN GROUPS)
 # ===============================
 async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -1170,8 +1193,8 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     BOT_ADMIN_CACHE.clear()
 
-    verified_groups = []   # 🔥 admin groups to save
-    skipped = 0
+    verified_groups = []
+    removed = 0
 
     for row in rows:
         gid = row["group_id"]
@@ -1181,32 +1204,31 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if me.status in ("administrator", "creator"):
                 BOT_ADMIN_CACHE.add(gid)
-                verified_groups.append(gid)   # ✅ collect
+                verified_groups.append(gid)
             else:
-                skipped += 1
+                removed += 1
 
         except Exception as e:
             print(f"⚠️ refresh_all skip {gid}: {e}")
-            skipped += 1
+            removed += 1
 
-        await asyncio.sleep(0.1)  # rate-limit safe
+        await asyncio.sleep(0.1)
 
-    # ===============================
-    # 🔥 BULK SAVE (ONE SHOT)
-    # ===============================
+    # 🔥 DB = ADMIN GROUPS ONLY
+    await db_execute("DELETE FROM groups")
+
     if verified_groups:
         values = ",".join(["(%s)"] * len(verified_groups))
         query = f"""
             INSERT INTO groups (group_id)
             VALUES {values}
-            ON CONFLICT DO NOTHING
         """
         await db_execute(query, tuple(verified_groups))
 
     await msg.reply_text(
         "🔄 <b>Refresh All Completed</b>\n\n"
         f"✅ Admin groups saved: {len(verified_groups)}\n"
-        f"⚠️ Skipped (kept in DB): {skipped}",
+        f"🗑️ Removed non-admin groups: {removed}",
         parse_mode="HTML"
     )
 

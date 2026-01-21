@@ -6,7 +6,6 @@ import time
 import asyncio
 import contextlib
 from html import escape
-from concurrent.futures import ThreadPoolExecutor  # ✅ REQUIRED
 
 from telegram import (
     Update,
@@ -22,6 +21,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ChatMemberHandler,
 )
 
 from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
@@ -34,9 +34,6 @@ USER_ADMIN_CACHE: dict[int, set[int]] = {}
 REMINDER_MESSAGES: dict[int, list[int]] = {}
 PENDING_BROADCAST = {}
 BOT_START_TIME = int(time.time())
-
-# 🔥 LINK SPAM CACHE (OPTION A CORE)
-LINK_SPAM_CACHE: dict[int, dict[int, tuple[int, int]]] = {}
 
 # ===============================
 # CONFIG
@@ -129,65 +126,124 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message
 
-    if not chat or chat.type != "private" or not user or not msg:
+    if not chat or not user or not msg:
         return
-
-    context.application.create_task(
-        db_execute(
-            "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
-            (user.id,)
-        )
-    )
 
     bot = context.bot
     bot_username = bot.username or ""
 
-    user_name = escape(user.first_name or "User")
-    bot_name = escape(bot.first_name or "Bot")
+    # ===============================
+    # 🔒 PRIVATE CHAT (/start)
+    # ===============================
+    if chat.type == "private":
 
-    user_mention = f"<a href='tg://user?id={user.id}'>{user_name}</a>"
-    bot_mention = (
-        f"<a href='https://t.me/{bot_username}'>{bot_name}</a>"
-        if bot_username else bot_name
-    )
-
-    text = (
-        f"<b>────「 {bot_mention} 」────</b>\n\n"
-        f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
-        "<b>ငါသည် Group များအတွက် Link ဖျက် Bot တစ်ခုဖြစ်တယ်။</b>\n"
-        "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
-        "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-        "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
-        "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
-        "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
-        "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-        "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
-        "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
-        "⭐️ ငါ့ကို Admin ပေးပါ"
-    )
-
-    buttons = []
-
-    if bot_username:
-        buttons.append([
-            InlineKeyboardButton(
-                "➕ ADD ME TO YOUR GROUP",
-                url=f"https://t.me/{bot_username}?startgroup=true"
+        # save user
+        context.application.create_task(
+            db_execute(
+                "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
+                (user.id,)
             )
+        )
+
+        user_name = escape(user.first_name or "User")
+        bot_name = escape(bot.first_name or "Bot")
+
+        user_mention = f"<a href='tg://user?id={user.id}'>{user_name}</a>"
+        bot_mention = (
+            f"<a href='https://t.me/{bot_username}'>{bot_name}</a>"
+            if bot_username else bot_name
+        )
+
+        text = (
+            f"<b>────「 {bot_mention} 」────</b>\n\n"
+            f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
+            "<b>ငါသည် Group များအတွက် Link ဖျက် Bot တစ်ခုဖြစ်တယ်။</b>\n"
+            "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
+            "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+            "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
+            "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
+            "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
+            "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+            "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
+            "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
+            "⭐️ ငါ့ကို Admin ပေးပါ"
+        )
+
+        buttons = []
+
+        if bot_username:
+            buttons.append([
+                InlineKeyboardButton(
+                    "➕ ADD ME TO YOUR GROUP",
+                    url=f"https://t.me/{bot_username}?startgroup=true"
+                )
+            ])
+
+        buttons.append([
+            InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
+            InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/MMTelegramBotss"),
         ])
 
-    buttons.append([
-        InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
-        InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/MMTelegramBotss"),
-    ])
+        await msg.reply_photo(
+            photo=START_IMAGE,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+    
+    # ===============================
+    # 👥 GROUP / SUPERGROUP (/start)
+    # ===============================
+    if chat.type in ("group", "supergroup"):
 
-    await msg.reply_photo(
-        photo=START_IMAGE,
-        caption=text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+        try:
+            me = await bot.get_chat_member(chat.id, bot.id)
+            is_admin = me.status in ("administrator", "creator")
+        except:
+            return
 
+        # ---------------------------
+        # ✅ BOT IS ADMIN
+        # ---------------------------
+        if is_admin:
+            text = (
+                "✅ <b>Bot သည် Admin အဖြစ် ခန့်ထားပြီးသားပါ</b>\n\n"
+                "🔗 Auto Link Delete\n"
+                "🔇 Spam Link Mute\n\n"
+                "🤖 Bot က လက်ရှိ Group မှာ အလုပ်လုပ်နေပါပြီ။"
+            )
+
+            await msg.reply_text(
+                text,
+                parse_mode="HTML"
+            )
+            return
+
+        # ---------------------------
+        # ❌ BOT IS NOT ADMIN
+        # ---------------------------
+        text = (
+            "⚠️ <b>Bot သည် Admin မဟုတ်သေးပါ</b>\n\n"
+            "🤖 Bot ကို အလုပ်လုပ်စေရန်\n"
+            "⭐️ <b>Admin Permission ပေးပါ</b>\n\n"
+            "Required: Delete messages"
+        )
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "⭐️ GIVE ADMIN PERMISSION",
+                url=f"https://t.me/{bot_username}?startgroup=true"
+            )
+        ]])
+
+        await msg.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        return
+ 
 # ===============================
 # /stats (OWNER ONLY - PRIVATE)
 # ===============================
@@ -573,13 +629,14 @@ def render_progress(done, total):
 # Broadcast flood-safe 
 # ===============================
 async def safe_send(func, *args, **kwargs):
-    while True:
+    for _ in range(5):
         try:
             return await func(*args, **kwargs)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after)
         except (Forbidden, BadRequest):
             return None
+    return None
 
 # ===============================
 # 📢 BROADCAST (OWNER ONLY)
@@ -660,14 +717,23 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
 
     target_type = query.data  # bc_target_users / bc_target_groups / bc_target_all
 
-    users = await db_execute("SELECT user_id FROM users", fetch=True) or []
-    groups = await db_execute("SELECT group_id FROM groups", fetch=True) or []
+    users = await db_execute(
+        "SELECT user_id FROM users",
+        fetch=True
+    ) or []
+
+    groups = await db_execute(
+        "SELECT group_id FROM groups WHERE is_admin_cached = TRUE",
+        fetch=True
+    ) or []
 
     if target_type == "bc_target_users":
         targets = [u["user_id"] for u in users]
+
     elif target_type == "bc_target_groups":
         targets = [g["group_id"] for g in groups]
-    else:
+
+    else:  # users + groups
         targets = list(set(
             [u["user_id"] for u in users] +
             [g["group_id"] for g in groups]
@@ -1307,7 +1373,14 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("refresh_all", refresh_all))
-   
+    
+    # -------------------------------
+    # On My Chat Member
+    # -------------------------------
+    app.add_handler(
+        ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+  
     # -------------------------------
     # Auto link delete (GROUP + SUPERGROUP ONLY)
     # -------------------------------
@@ -1364,8 +1437,10 @@ def main():
     app.post_init = on_startup
 
     print("🤖 Link Delete Bot running (PRODUCTION READY)")
-    app.run_polling(close_loop=False)
-
+    try:
+        app.run_polling(close_loop=False)
+    finally:
+        pool.close()
 
 if __name__ == "__main__":
     main()

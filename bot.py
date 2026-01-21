@@ -1073,36 +1073,47 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-
 # ===============================
-# Admin Reminder (FIXED)
+# Admin Reminder (SAFE FIXED)
 # ===============================
 async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
 
     if not context.job or not context.job.data:
         return
 
-    chat_id = context.job.data["chat_id"]
-    count = context.job.data["count"]
-    total = context.job.data["total"]
+    chat_id = context.job.data.get("chat_id")
+    count = context.job.data.get("count")
+    total = context.job.data.get("total")
 
-    # ✅ Already admin → stop reminders
+    if not chat_id:
+        return
+
+    # ✅ already cached as admin → stop everything
     if chat_id in BOT_ADMIN_CACHE:
         clear_reminders(context, chat_id)
         return
 
+    # 🔐 STEP 1: Check bot still in group
     try:
-        # 🔍 check bot permission again
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status in ("administrator", "creator"):
-            BOT_ADMIN_CACHE.add(chat_id)
-            clear_reminders(context, chat_id)
-            return
+    except Exception:
+        # ❌ bot kicked / group deleted
+        clear_reminders(context, chat_id)
+        BOT_ADMIN_CACHE.discard(chat_id)
+        REMINDER_MESSAGES.pop(chat_id, None)
+        return
 
-        # ✅ correct username source
+    # ✅ STEP 2: Bot is admin now → stop reminders
+    if me.status in ("administrator", "creator"):
+        BOT_ADMIN_CACHE.add(chat_id)
+        clear_reminders(context, chat_id)
+        return
+
+    # ❌ STEP 3: Bot still member → send reminder
+    try:
         bot = await context.bot.get_me()
 
-        keyboard = InlineKeyboardMarkup([[  
+        keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "⭐️ GIVE ADMIN PERMISSION",
                 url=f"https://t.me/{bot.username}?startgroup=true"
@@ -1121,8 +1132,11 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
 
         REMINDER_MESSAGES.setdefault(chat_id, []).append(msg.message_id)
 
-    except Exception as e:
-        print(f"❌ admin_reminder error in {chat_id}:", e)
+    except Exception:
+        # ❌ any unexpected error → stop future reminders
+        clear_reminders(context, chat_id)
+        BOT_ADMIN_CACHE.discard(chat_id)
+        REMINDER_MESSAGES.pop(chat_id, None)
 
 # ===============================
 # delete message job (FIXED)

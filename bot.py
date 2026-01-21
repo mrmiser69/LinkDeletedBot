@@ -101,14 +101,6 @@ async def init_db():
     """)
 
     await db_execute("""
-        CREATE TABLE IF NOT EXISTS delete_jobs (
-            chat_id BIGINT,
-            message_id BIGINT,
-            run_at BIGINT
-        )
-    """)
-
-    await db_execute("""
         CREATE TABLE IF NOT EXISTS link_spam (
             chat_id BIGINT,
             user_id BIGINT,
@@ -318,33 +310,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# ⏱️ DELETE JOB CONFIG
-# ===============================
-DELETE_AFTER = 18000  # 5 hour 
-
-# ===============================
-# schedule delete message (SAFE)
-# ===============================
-async def schedule_delete_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_id: int,
-    delay: int
-):
-    run_at = int(time.time()) + delay
-
-    # DB မှာပဲ save (restart အတွက်)
-    context.application.create_task(
-        db_execute(
-            "INSERT INTO delete_jobs VALUES (%s,%s,%s)",
-            (chat_id, message_id, run_at)
-        )
-    )
-
-    # ❗ JobQueue မသုံးတော့ဘူး
-    # delete job ကို schedule မလုပ်
-
-# ===============================
 # LINK + MUTE CONFIG
 # ===============================
 LINK_LIMIT = 3          # links before mute
@@ -463,15 +428,6 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-    # ---- AUTO DELETE WARN
-    if warn:
-        await schedule_delete_message(
-            context,
-            chat_id,
-            warn.message_id,
-            DELETE_AFTER
-        )
-
 # ===============================
 # LINK COUNT + MUTE (RETURN RESULT)
 # ===============================
@@ -543,43 +499,6 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     )
 
     return True  # 🔥 IMPORTANT
-
-# ===============================
-# 🔄 RESTORE JOBS ON START (SAFE – NO JOBQUEUE)
-# ===============================
-async def restore_jobs(app):
-    now = int(time.time())
-
-    try:
-        rows = await db_execute(
-            "SELECT chat_id, message_id, run_at FROM delete_jobs",
-            fetch=True
-        )
-    except Exception as e:
-        print("⚠️ restore_jobs DB error:", e)
-        return
-
-    if not rows:
-        return
-
-    for row in rows:
-        run_at = row["run_at"]
-
-        # expired → clean DB only
-        if run_at <= now:
-            await db_execute(
-                "DELETE FROM delete_jobs WHERE chat_id=%s AND message_id=%s",
-                (row["chat_id"], row["message_id"])
-            )
-            continue
-
-        # ❗ JobQueue မရှိတဲ့အတွက်
-        # Bot restart ပြီးတဲ့ message delete ကို SKIP
-        # (Bot crash မဖြစ်အောင်)
-        print(
-            f"ℹ️ Skip restore delete job "
-            f"(chat={row['chat_id']}, msg={row['message_id']})"
-        )
 
 # ===============================
 # Save Group (ADMIN ONLY)
@@ -892,9 +811,6 @@ async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
     context.application.create_task(
         db_execute("DELETE FROM link_spam WHERE chat_id=%s", (chat_id,))
     )
-    context.application.create_task(
-        db_execute("DELETE FROM delete_jobs WHERE chat_id=%s", (chat_id,))
-    )
 
     # 🚪 Leave group
     try:
@@ -959,11 +875,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BOT_ADMIN_CACHE.add(chat.id)
         clear_reminders(context, chat.id)
 
-        # 🔥 delete admin request messages
+        # 🔥 delete admin request / reminder messages
         for mid in REMINDER_MESSAGES.pop(chat.id, []):
             with contextlib.suppress(Exception):
                 await context.bot.delete_message(chat.id, mid)
 
+        # 💾 save group admin status
         context.application.create_task(
             db_execute(
                 """
@@ -978,23 +895,15 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        # ✅ thank you message (KEEP FOREVER)
         try:
-            thank = await context.bot.send_message(
+            await context.bot.send_message(
                 chat.id,
                 "✅ <b>Thank you!</b>\n\n"
                 "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n"
                 "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီ..........!",
                 parse_mode="HTML"
             )
-
-            # schedule delete (only if job_queue exists)
-            if context.job_queue:
-                await schedule_delete_message(
-                    context,
-                    chat.id,
-                    thank.message_id,
-                    300
-                )
         except:
             pass
 
@@ -1137,34 +1046,6 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
         clear_reminders(context, chat_id)
         BOT_ADMIN_CACHE.discard(chat_id)
         REMINDER_MESSAGES.pop(chat_id, None)
-
-# ===============================
-# delete message job (FIXED)
-# ===============================
-async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
-    if not context.job or not context.job.data:
-        return
-
-    chat_id = context.job.data.get("chat_id")
-    message_id = context.job.data.get("message_id")
-
-    if not chat_id or not message_id:
-        return
-
-    try:
-        await context.bot.delete_message(chat_id, message_id)
-    except Exception as e:
-        # message already deleted / no permission → ignore but log
-        print(f"⚠️ delete_message_job failed {chat_id}:{message_id} →", e)
-
-    # 🧹 cleanup DB (ALWAYS)
-    try:
-        await db_execute(
-            "DELETE FROM delete_jobs WHERE chat_id=%s AND message_id=%s",
-            (chat_id, message_id)
-        )
-    except Exception as e:
-        print(f"⚠️ delete_jobs DB cleanup failed:", e)
 
 # ===============================
 # bot admin check
@@ -1445,7 +1326,6 @@ def main():
         except Exception as e:
             print("⚠️ DB init failed:", e)
 
-        await restore_jobs(app)
         await refresh_admin_cache(app)
 
     app.post_init = on_startup

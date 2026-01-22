@@ -51,27 +51,15 @@ DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 # =====================================
 # DB POOL (RAILWAY SAFE)
 # =====================================
-pool = ConnectionPool(
-    conninfo=(
-        f"host={DB_HOST} "
-        f"dbname={DB_NAME} "
-        f"user={DB_USER} "
-        f"password={DB_PASS} "
-        f"port={DB_PORT} "
-        f"sslmode=require"
-    ),
-    min_size=1,
-    max_size=5,
-    timeout=5,
-    kwargs={                      
-        "prepare_threshold": None 
-    }
-)
+pool = None
 
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
 
     def _run():
+        if pool is None:
+            raise RuntimeError("DB pool not initialized")
+
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
@@ -1285,23 +1273,53 @@ def main():
     # Startup jobs (ORDER IS CRITICAL)
     # -------------------------------
     async def on_startup(app):
-        
+        global pool
+
+        print("🟡 Starting bot...", flush=True)
+
         await app.bot.delete_webhook(drop_pending_updates=True)
-        
+
+        try:
+            pool = ConnectionPool(
+                conninfo=(
+                    f"host={DB_HOST} "
+                    f"dbname={DB_NAME} "
+                    f"user={DB_USER} "
+                    f"password={DB_PASS} "
+                    f"port={DB_PORT} "
+                    f"sslmode=require"
+                ),
+                min_size=1,
+                max_size=5,
+                timeout=5,
+                kwargs={"prepare_threshold": None}
+            )
+            print("✅ DB pool created", flush=True)
+
+        except Exception as e:
+            print("❌ DB pool creation failed:", e, flush=True)
+            return   # ❗ bot ဆက်မ run စေချင်ရင်
+
         try:
             await init_db()
+            print("✅ DB init done", flush=True)
         except Exception as e:
-            print("⚠️ DB init failed:", e)
+            print("⚠️ DB init failed:", e, flush=True)
 
-        await refresh_admin_cache(app)
+        try:
+            await refresh_admin_cache(app)
+            print("✅ Admin cache refreshed", flush=True)
+        except Exception as e:
+            print("⚠️ Refresh admin cache failed:", e, flush=True)
 
-    app.post_init = on_startup
+        app.post_init = on_startup
 
-    print("🤖 Link Delete Bot running (PRODUCTION READY)")
-    try:
-        app.run_polling(close_loop=False)
-    finally:
-        pool.close()
+        print("🤖 Link Delete Bot running (PRODUCTION READY)", flush=True)
+    
+        try:
+            app.run_polling(close_loop=False)
+        finally:
+            pool.close()
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()

@@ -184,8 +184,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return  # cannot access → silent
 
         # 🔕 No send permission → SILENT
-        if not me.can_send_messages:
-            return
+        if me.status in ("member", "restricted"):
+            if not getattr(me, "can_send_messages", True):
+                return  # silent
 
         # ---------------------------
         # ✅ BOT IS ADMIN

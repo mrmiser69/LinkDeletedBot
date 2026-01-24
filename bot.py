@@ -29,6 +29,14 @@ from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 # ===============================
 # GLOBAL CACHES
 # ===============================
+STATS_CACHE = {
+    "users": 0,
+    "groups": 0,
+    "admin_groups": 0,
+    "last_update": 0
+}
+STATS_TTL = 300  # 5 minutes
+
 BOT_ADMIN_CACHE: set[int] = set()
 USER_ADMIN_CACHE: dict[int, set[int]] = {}
 REMINDER_MESSAGES: dict[int, list[int]] = {}
@@ -225,7 +233,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /stats (OWNER ONLY - PRIVATE)
 # ===============================
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat = update.effective_chat
     user = update.effective_user
     msg = update.effective_message
@@ -239,59 +246,48 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         return
 
-    try:
-        users_task = db_execute(
-            "SELECT COUNT(*) AS c FROM users",
-            fetch=True
-        )
-        groups_task = db_execute(
-            "SELECT COUNT(*) AS c FROM groups",
-            fetch=True
-        )
+    now = time.time()
 
-        users, groups = await asyncio.gather(
-            users_task,
-            groups_task,
-            return_exceptions=True
-        )
+    # 🔒 Cache valid → DB မထိ
+    if now - STATS_CACHE["last_update"] > STATS_TTL:
+        try:
+            users = await db_execute(
+                "SELECT COUNT(*) AS c FROM users",
+                fetch=True
+            )
+            groups = await db_execute(
+                "SELECT COUNT(*) AS c FROM groups",
+                fetch=True
+            )
+            admin_groups = await db_execute(
+                "SELECT COUNT(*) AS c FROM groups WHERE is_admin_cached = TRUE",
+                fetch=True
+            )
 
-        if isinstance(users, Exception):
-            print("⚠️ STATS users query failed:", users)
-            user_count = 0
-        else:
-            user_count = users[0]["c"] if users else 0
+            STATS_CACHE["users"] = users[0]["c"] if users else 0
+            STATS_CACHE["groups"] = groups[0]["c"] if groups else 0
+            STATS_CACHE["admin_groups"] = admin_groups[0]["c"] if admin_groups else 0
+            STATS_CACHE["last_update"] = now
 
-        if isinstance(groups, Exception):
-            print("⚠️ STATS groups query failed:", groups)
-            group_count = 0
-        else:
-            group_count = groups[0]["c"] if groups else 0
+        except Exception as e:
+            print("❌ STATS DB ERROR:", e)
 
-    except Exception as e:
-        print("❌ STATS FAILED:", e)
-        await msg.reply_text("❌ Stats temporarily unavailable")
-        return
-
-    # ✅ CACHE-SAFE COUNT
-    rows = await db_execute(
-        "SELECT COUNT(*) AS c FROM groups WHERE is_admin_cached = TRUE",
-        fetch=True
+    no_admin = max(
+        0,
+        STATS_CACHE["groups"] - STATS_CACHE["admin_groups"]
     )
-    admin_groups = rows[0]["c"] if rows else 0
-
-    no_admin_groups = max(0, group_count - admin_groups)
 
     uptime = int(time.time()) - BOT_START_TIME
     h, m = divmod(uptime // 60, 60)
 
     await msg.reply_text(
         "📊 <b>Bot Statistics</b>\n\n"
-        f"👤 Users: <b>{user_count}</b>\n"
-        f"👥 Groups: <b>{group_count}</b>\n\n"
-        f"🔐 Admin Groups: <b>{admin_groups}</b>\n"
-        f"⚠️ No Admin Groups: <b>{no_admin_groups}</b>\n\n"
+        f"👤 Users: <b>{STATS_CACHE['users']}</b>\n"
+        f"👥 Groups: <b>{STATS_CACHE['groups']}</b>\n\n"
+        f"🔐 Admin Groups: <b>{STATS_CACHE['admin_groups']}</b>\n"
+        f"⚠️ No Admin Groups: <b>{no_admin}</b>\n\n"
         f"⏱️ Uptime: <b>{h}h {m}m</b>",
-        parse_mode="HTML",
+        parse_mode="HTML"
     )
 
 # ===============================
@@ -325,9 +321,6 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     except:
         return
-    
-    # ✅ cache update (safe)
-    BOT_ADMIN_CACHE.add(chat_id)
     
     # ADMIN BYPASS
     try:
@@ -396,33 +389,24 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except:
             pass
-    
-    # 💾 DB SAVE (ADMIN ONLY – SAFE)
-    
-    context.application.create_task(
-            db_execute(
-                """
-                INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
-                VALUES (%s, TRUE, %s)
-                ON CONFLICT (group_id)
-                DO UPDATE SET
-                    is_admin_cached = TRUE,
-                    last_checked_at = EXCLUDED.last_checked_at
-                """,
-                (chat.id, int(time.time()))
-            )
-        )
 
 # ===============================
-# LINK COUNT + MUTE (RETURN RESULT)
+# LINK COUNT + MUTE (DB SAFE - OPTIMIZED)
 # ===============================
 async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     now = int(time.time())
 
+    # ----------------------------------
+    # FETCH EXISTING RECORD (FAST)
+    # ----------------------------------
     try:
         rows = await asyncio.wait_for(
             db_execute(
-                "SELECT count, last_time FROM link_spam WHERE chat_id=%s AND user_id=%s",
+                """
+                SELECT count, last_time
+                FROM link_spam
+                WHERE chat_id=%s AND user_id=%s
+                """,
                 (chat_id, user_id),
                 fetch=True
             ),
@@ -431,26 +415,55 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     except:
         return False
 
-    # ---- COUNT
+    # ----------------------------------
+    # EARLY EXIT (IMPORTANT FIX)
+    # user recently muted → skip DB work
+    # ----------------------------------
     if rows:
-        last = rows[0]
-        count = 1 if now - last["last_time"] > SPAM_RESET_SECONDS else last["count"] + 1
+        last_time = rows[0]["last_time"]
+
+        # user is still inside mute window
+        if now - last_time < MUTE_SECONDS:
+            return False
+
+    # ----------------------------------
+    # COUNT CALCULATION
+    # ----------------------------------
+    if rows:
+        prev = rows[0]
+        count = (
+            1
+            if now - prev["last_time"] > SPAM_RESET_SECONDS
+            else prev["count"] + 1
+        )
+
         await db_execute(
-            "UPDATE link_spam SET count=%s, last_time=%s WHERE chat_id=%s AND user_id=%s",
+            """
+            UPDATE link_spam
+            SET count=%s, last_time=%s
+            WHERE chat_id=%s AND user_id=%s
+            """,
             (count, now, chat_id, user_id)
         )
     else:
         count = 1
         await db_execute(
-            "INSERT INTO link_spam VALUES (%s,%s,%s,%s)",
+            """
+            INSERT INTO link_spam (chat_id, user_id, count, last_time)
+            VALUES (%s,%s,%s,%s)
+            """,
             (chat_id, user_id, count, now)
         )
 
-    # ---- NOT REACHED LIMIT
+    # ----------------------------------
+    # LIMIT NOT REACHED
+    # ----------------------------------
     if count < LINK_LIMIT:
         return False
 
-    # ---- SUPERGROUP ONLY
+    # ----------------------------------
+    # SUPERGROUP ONLY
+    # ----------------------------------
     try:
         chat = await context.bot.get_chat(chat_id)
         if chat.type != "supergroup":
@@ -458,7 +471,9 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     except:
         return False
 
-    # ---- BOT PERMISSION
+    # ----------------------------------
+    # BOT PERMISSION CHECK
+    # ----------------------------------
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
         if not me.can_restrict_members:
@@ -466,7 +481,9 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     except:
         return False
 
-    # ---- MUTE
+    # ----------------------------------
+    # MUTE USER
+    # ----------------------------------
     try:
         await context.bot.restrict_chat_member(
             chat_id,
@@ -477,37 +494,15 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     except:
         return False
 
-    # ---- RESET COUNTER
+    # ----------------------------------
+    # CLEANUP RECORD (OPTIONAL BUT GOOD)
+    # ----------------------------------
     await db_execute(
         "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
         (chat_id, user_id)
     )
 
-    return True  # 🔥 IMPORTANT
-
-# ===============================
-# Progress Bar Helper 
-# ===============================
-def render_progress(done, total):
-    if total <= 0:
-        return "██████████ 100%"
-    percent = int((done / total) * 100)
-    blocks = min(10, percent // 10)
-    bar = "█" * blocks + "░" * (10 - blocks)
-    return f"{bar} {percent}%"
-
-# ===============================
-# Broadcast flood-safe 
-# ===============================
-async def safe_send(func, *args, **kwargs):
-    for _ in range(5):
-        try:
-            return await func(*args, **kwargs)
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-        except (Forbidden, BadRequest):
-            return None
-    return None
+    return True
 
 # ===============================
 # 📢 BROADCAST (OWNER ONLY)
@@ -575,6 +570,67 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
     )
 
 # ===============================
+# Progress Bar Helper 
+# ===============================
+def render_progress(done, total):
+    if total <= 0:
+        return "██████████ 100%"
+    percent = int((done / total) * 100)
+    blocks = min(10, percent // 10)
+    bar = "█" * blocks + "░" * (10 - blocks)
+    return f"{bar} {percent}%"
+
+# ===============================
+# update progress 
+# ===============================
+async def update_progress(msg, sent, total):
+    if total <= 0:
+        percent = 100
+    else:
+        percent = int((sent / total) * 100)
+
+    bar_blocks = min(10, percent // 10)
+    bar = "█" * bar_blocks + "░" * (10 - bar_blocks)
+
+    try:
+        await msg.edit_text(
+            "📢 <b>Broadcasting...</b>\n\n"
+            f"⏳ Progress: {bar} {percent}%",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+
+# ===============================
+# Broadcast flood-safe 
+# ===============================
+async def safe_send(func, *args, **kwargs):
+    for _ in range(5):
+        try:
+            return await func(*args, **kwargs)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except (Forbidden, BadRequest):
+            return None
+    return None
+
+# ===============================
+# BATCH DB READ (10k+ SAFE)
+# ===============================
+async def iter_db_ids(query, batch_size=500):
+    offset = 0
+    while True:
+        rows = await db_execute(
+            f"{query} LIMIT %s OFFSET %s",
+            (batch_size, offset),
+            fetch=True
+        )
+        if not rows:
+            break
+        yield rows
+        offset += batch_size
+
+# ===============================
 # Broadcast Target Handler
 # ===============================
 async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,76 +644,57 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
 
     target_type = query.data  # bc_target_users / bc_target_groups / bc_target_all
 
-    users = await db_execute(
-        "SELECT user_id FROM users",
-        fetch=True
-    ) or []
-
-    groups = await db_execute(
-        "SELECT group_id FROM groups WHERE is_admin_cached = TRUE",
-        fetch=True
-    ) or []
-
-    if target_type == "bc_target_users":
-        targets = [u["user_id"] for u in users]
-
-    elif target_type == "bc_target_groups":
-        targets = [g["group_id"] for g in groups]
-
-    else:  # users + groups
-        targets = list(set(
-            [u["user_id"] for u in users] +
-            [g["group_id"] for g in groups]
-        ))
-
-    total = len(targets)
-    sent = 0
-
     progress_msg = await query.edit_message_text(
         "📢 <b>Broadcasting...</b>\n\n⏳ Progress: 0%",
         parse_mode="HTML"
     )
-
-    async def progress_updater():
-        while sent < total:
-            try:
-                await progress_msg.edit_text(
-                    f"📢 <b>Broadcasting...</b>\n\n⏳ Progress: {render_progress(sent, total)}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-            await asyncio.sleep(2)
-
-    progress_task = asyncio.create_task(progress_updater())
-
-    BATCH_SIZE = 10
+    
+    sent = 0
     start_time = time.time()
+    
+    total = 0
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = targets[i:i + BATCH_SIZE]
+    if target_type in ("bc_target_users", "bc_target_all"):
+        rows = await db_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
+        total += rows[0]["c"] if rows else 0
 
-        results = await asyncio.gather(
-            *[safe_send(send_content, context, cid, data) for cid in batch],
-            return_exceptions=True
+    if target_type in ("bc_target_groups", "bc_target_all"):
+        rows = await db_execute(
+            "SELECT COUNT(*) AS c FROM groups WHERE is_admin_cached = TRUE",
+            fetch=True
         )
+        total += rows[0]["c"] if rows else 0
 
-        for cid, result in zip(batch, results):
+    async def send_batch(ids):
+        nonlocal sent
+        for cid in ids:
+            await safe_send(send_content, context, cid, data)
             sent += 1
-            # ❌ DB delete logic REMOVED
-            if result is None or isinstance(result, Exception):
-                pass   # error ဖြစ်ရင် ignore only
 
-    progress_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await progress_task
+            # 🔄 update every 50 messages (SAFE)
+            if sent % 50 == 0 or sent == total:
+                await update_progress(progress_msg, sent, total)
+
+    # 👤 USERS
+    if target_type in ("bc_target_users", "bc_target_all"):
+        async for rows in iter_db_ids(
+            "SELECT user_id FROM users ORDER BY user_id"
+        ):
+            await send_batch([r["user_id"] for r in rows])
+
+    # 👥 GROUPS (ADMIN ONLY)
+    if target_type in ("bc_target_groups", "bc_target_all"):
+        async for rows in iter_db_ids(
+            "SELECT group_id FROM groups WHERE is_admin_cached = TRUE ORDER BY group_id"
+        ):
+            await send_batch([r["group_id"] for r in rows])
 
     elapsed = int(time.time() - start_time)
 
     await progress_msg.edit_text(
         "✅ <b>Broadcast Completed</b>\n\n"
-        f"🎯 Target: {total}\n"
-        f"⏱️ Time: {elapsed // 60}m {elapsed % 60}s",
+        f"📨 Sent: <b>{sent}</b>\n"
+        f"⏱️ Time: <b>{elapsed // 60}m {elapsed % 60}s</b>",
         parse_mode="HTML"
     )
 

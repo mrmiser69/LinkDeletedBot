@@ -307,30 +307,15 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not chat or not msg or not user:
         return
-
     if chat.type not in ("group", "supergroup"):
         return
 
     chat_id = chat.id
     user_id = user.id
 
-    # BOT ADMIN CHECK
-    try:
-        me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status not in ("administrator", "creator"):
-            return
-    except:
-        return
-    
-    # ADMIN BYPASS
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status in ("administrator", "creator"):
-            return
-    except:
-        return
-
-    # LINK DETECT
+    # ===============================
+    # 🔥 STEP 1: LINK DETECT FIRST (NO API)
+    # ===============================
     has_link = False
     entities = []
 
@@ -348,10 +333,33 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "http://" in text or "https://" in text or "t.me/" in text:
         has_link = True
 
+    # 🚀 NO LINK → EXIT IMMEDIATELY (BIG SPEED BOOST)
     if not has_link:
         return
 
-    # ---- DELETE
+    # ===============================
+    # 🔐 STEP 2: BOT ADMIN CHECK (ONLY IF LINK)
+    # ===============================
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if me.status not in ("administrator", "creator"):
+            return
+    except:
+        return
+
+    # ===============================
+    # 👮 STEP 3: ADMIN BYPASS
+    # ===============================
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ("administrator", "creator"):
+            return
+    except:
+        return
+
+    # ===============================
+    # 🗑️ STEP 4: DELETE MESSAGE
+    # ===============================
     try:
         await msg.delete()
     except BadRequest as e:
@@ -360,10 +368,10 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("❌ Delete failed:", e)
         return
-    
+
     user_mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    
-    # ---- DELETE WARN
+
+    # ⚠️ Warn
     try:
         await context.bot.send_message(
             chat_id,
@@ -374,21 +382,23 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # ---- COUNT + MUTE (SYNC)
+    # ===============================
+    # 🔢 STEP 5: COUNT + MUTE
+    # ===============================
     muted = await link_spam_control(chat_id, user_id, context)
 
-    # ---- MUTE WARN 🔥 (FIX)
     if muted:
         try:
             await context.bot.send_message(
                 chat_id,
-                f"🔇 <b>{user_mention}</b> ကို\n"
+                f"🔇 <b>{user_mention}</b>\n"
                 f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
                 f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီး",
                 parse_mode="HTML"
             )
         except:
             pass
+
 
 # ===============================
 # LINK COUNT + MUTE (DB SAFE - OPTIMIZED)

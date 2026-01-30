@@ -6,6 +6,7 @@ import time
 import asyncio
 import contextlib
 from html import escape
+from telegram.ext import PreCheckoutQueryHandler
 
 from telegram import (
     Update,
@@ -133,78 +134,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===============================
     if chat.type == "private":
 
-        # ---------------------------
-        # ✅ Deep-link flows (no extra handlers needed)
-        # t.me/<bot>?start=donate
-        # t.me/<bot>?start=donate_bot
-        # t.me/<bot>?start=donate_dev
-        # t.me/<bot>?start=donate_ton
-        # ---------------------------
-        arg = (context.args[0] if getattr(context, "args", None) else "").strip().lower()
-
-        # ===============================
-        # 💖 DONATE MENU
-        # ===============================
-        if arg == "donate":
-            donate_text = (
-                "<b>💖 Support Us</b>\n\n"
-                "မင်းအတွက် အလုပ်ကောင်းကောင်းလုပ်နေတဲ့ Bot ကို Support ပေးနိုင်ပါတယ်။\n\n"
-                "👇 အောက်ကနေ ရွေးပါ"
-            )
-            donate_buttons = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("⭐️ Support Bot (5 Stars)", url=f"https://t.me/{bot_username}?start=donate_bot")
-                ],
-                [
-                    InlineKeyboardButton("💸 Support Developer", url=f"https://t.me/{bot_username}?start=donate_dev")
-                ],
-                [
-                    InlineKeyboardButton("⬅️ Back", url=f"https://t.me/{bot_username}")
-                ],
-            ])
-            await msg.reply_text(donate_text, parse_mode="HTML", reply_markup=donate_buttons)
-            return
-
-        # ===============================
-        # ⭐️ Support Bot (Telegram Stars)
-        # ===============================
-        if arg == "donate_bot":
-            # NOTE: Stars donate = Stars balance goes to "this bot" (bot owner can withdraw/claim via Telegram tools)
-            # Local import to avoid changing global imports
-            from telegram import LabeledPrice
-
-            try:
-                await context.bot.send_invoice(
-                    chat_id=chat.id,
-                    title="Support Bot",
-                    description="Donate 5 Telegram Stars ⭐️",
-                    payload=f"donate_bot_5_{user.id}",
-                    currency="XTR",  # Telegram Stars currency
-                    prices=[LabeledPrice("Support", 5)],  # 5 Stars
-                    provider_token="",  # Stars usually use empty provider_token
-                )
-            except Exception as e:
-                await msg.reply_text(f"❌ Donate မလုပ်နိုင်ပါ: {e}")
-            return
-
-        # ===============================
-        # 🟦 TON Donate details
-        # ===============================
-        if arg in ("donate_dev", "donate_ton"):
-            TON_ADDRESS = os.getenv("TON_ADDRESS", "PUT_YOUR_TON_ADDRESS_HERE")
-            ton_text = (
-                "<b>🟦 Support Developer (TON)</b>\n\n"
-                f"<b>TON Address:</b>\n<code>{escape(TON_ADDRESS)}</code>\n\n"
-                "Address ကို copy လုပ်ပြီး TON ပို့ပါ ✅"
-            )
-            ton_buttons = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("⬅️ Back", url=f"https://t.me/{bot_username}?start=donate"),
-                ],
-            ])
-            await msg.reply_text(ton_text, parse_mode="HTML", reply_markup=ton_buttons)
-            return
-
         # save user
         context.application.create_task(
             db_execute(
@@ -247,14 +176,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ])
 
-        # ✅ Donate Us button
-        if bot_username:
-            buttons.append([
-                InlineKeyboardButton(
-                    "💖 DONATE US",
-                    url=f"https://t.me/{bot_username}?start=donate"
-                )
-            ])
+        # ✅ Donate Us button (Callback)
+        buttons.append([
+            InlineKeyboardButton("💖 DONATE US", callback_data="donate_menu")
+        ])
 
         buttons.append([
             InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
@@ -317,7 +242,159 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
         )
         return
- 
+
+# ===============================
+# Donate Callback
+# =============================== 
+async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+
+    data = (query.data or "").strip()
+
+    # This donate UI only makes sense in private chat
+    if query.message.chat.type != "private":
+        return
+
+    bot = context.bot
+    bot_username = bot.username or ""
+    user = update.effective_user
+
+    # --- 1) Donate Menu ---
+    if data == "donate_menu":
+        donate_text = (
+            "<b>💖 Support Us</b>\n\n"
+            "မင်းအတွက် အလုပ်ကောင်းကောင်းလုပ်နေတဲ့ Bot ကို Support ပေးနိုင်ပါတယ်။\n\n"
+            "👇 အောက်ကနေ ရွေးပါ"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐️ Support Bot (5 Stars)", callback_data="donate_stars_5")],
+            [InlineKeyboardButton("🟦 Support Developer (TON)", callback_data="donate_ton")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="donate_back_start")],
+        ])
+
+        # Your /start is a PHOTO message -> edit_caption
+        await query.message.edit_caption(
+            caption=donate_text,
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return
+
+    # --- 2) Back to original /start ---
+    if data == "donate_back_start":
+        # rebuild original caption + keyboard exactly like /start private
+        user_name = escape(user.first_name or "User")
+        bot_name = escape(bot.first_name or "Bot")
+        user_mention = f"<a href='tg://user?id={user.id}'>{user_name}</a>"
+        bot_mention = (
+            f"<a href='https://t.me/{bot_username}'>{bot_name}</a>"
+            if bot_username else bot_name
+        )
+
+        start_text = (
+            f"<b>────「 {bot_mention} 」────</b>\n\n"
+            f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
+            "<b>ငါသည် Group များအတွက် Link ဖျက် Bot တစ်ခုဖြစ်တယ်။</b>\n"
+            "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
+            "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+            "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
+            "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
+            "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
+            "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+            "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
+            "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
+            "⭐️ ငါ့ကို Admin ပေးပါ"
+        )
+
+        buttons = []
+        if bot_username:
+            buttons.append([
+                InlineKeyboardButton(
+                    "➕ ADD ME TO YOUR GROUP",
+                    url=f"https://t.me/{bot_username}?startgroup=true"
+                )
+            ])
+
+        buttons.append([InlineKeyboardButton("💖 DONATE US", callback_data="donate_menu")])
+
+        buttons.append([
+            InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
+            InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/MMTelegramBotss"),
+        ])
+
+        await query.message.edit_caption(
+            caption=start_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # --- 3) TON address page ---
+    if data == "donate_ton":
+        TON_ADDRESS = os.getenv("TON_ADDRESS", "PUT_YOUR_TON_ADDRESS_HERE")
+        ton_text = (
+            "<b>🟦 Support Developer (TON)</b>\n\n"
+            f"<b>TON Address:</b>\n<code>{escape(TON_ADDRESS)}</code>\n\n"
+            "Address ကို copy လုပ်ပြီး TON ပို့ပါ ✅"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="donate_menu")],
+        ])
+        await query.message.edit_caption(
+            caption=ton_text,
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return
+
+    # --- 4) Stars 5 invoice ---
+    if data == "donate_stars_5":
+        # Stars invoice needs pre_checkout + successful payment handlers too
+        from telegram import LabeledPrice
+
+        try:
+            await context.bot.send_invoice(
+                chat_id=query.message.chat.id,
+                title="Support Bot",
+                description="Donate 5 Telegram Stars ⭐️",
+                payload=f"donate_bot_5_{user.id}",
+                currency="XTR",
+                prices=[LabeledPrice("Support", 5)],
+                provider_token="",  # Stars often use empty provider_token
+            )
+        except Exception as e:
+            # Keep UX: show error as alert, not new message spam
+            await query.answer(f"❌ Donate မလုပ်နိုင်ပါ: {e}", show_alert=True)
+        return
+
+# ===============================
+# Precheckout Callback
+# ===============================
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    if not query:
+        return
+
+    # ✅ accept only our donate payloads
+    if not (query.payload or "").startswith("donate_bot_5_"):
+        await query.answer(ok=False, error_message="Invalid payment payload.")
+        return
+
+    await query.answer(ok=True)
+
+# ===============================
+# Successful Payment Handler
+# ===============================
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text("✅ ကျေးဇူးတင်ပါတယ်! Stars Donate လုပ်ပြီးပါပြီ ⭐️")
+
 # ===============================
 # /stats (OWNER ONLY - PRIVATE)
 # ===============================
@@ -1403,6 +1480,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("refresh_all", refresh_all))
+    app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     # -------------------------------
     # Chat Member

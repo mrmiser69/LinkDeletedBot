@@ -8,6 +8,7 @@ import contextlib
 from html import escape
 from telegram.ext import PreCheckoutQueryHandler
 import re
+from telegram.constants import MessageEntityType
 
 from telegram import (
     Update,
@@ -749,6 +750,102 @@ async def cleanup_link_spam_cache(context: ContextTypes.DEFAULT_TYPE):
         print(f"🧹 RAM cache cleaned: {removed} entries")
 
 # ===============================
+# entities html
+# ===============================
+def entities_to_html(msg) -> str:
+    """
+    Convert message text/caption + entities to HTML safely (works across PTB versions).
+    Supports: bold, italic, underline, strikethrough, spoiler, code, pre, text_link, url, mention, text_mention.
+    """
+    text = msg.caption if msg.caption is not None else (msg.text or "")
+    if not text:
+        return ""
+
+    entities = []
+    if msg.caption is not None:
+        entities = list(msg.caption_entities or [])
+    else:
+        entities = list(msg.entities or [])
+
+    if not entities:
+        return escape(text)
+
+    # Build tags mapping
+    opens = {}
+    closes = {}
+    for e in entities:
+        start = e.offset
+        end = e.offset + e.length
+        opens.setdefault(start, []).append(e)
+        closes.setdefault(end, []).append(e)
+
+    # ensure proper nesting: close inner first, open outer first
+    def open_tag(e):
+        t = e.type
+        if t == MessageEntityType.BOLD:
+            return "<b>"
+        if t == MessageEntityType.ITALIC:
+            return "<i>"
+        if t == MessageEntityType.UNDERLINE:
+            return "<u>"
+        if t == MessageEntityType.STRIKETHROUGH:
+            return "<s>"
+        if t == MessageEntityType.SPOILER:
+            return '<span class="tg-spoiler">'
+        if t == MessageEntityType.CODE:
+            return "<code>"
+        if t == MessageEntityType.PRE:
+            return "<pre>"
+        if t == MessageEntityType.TEXT_LINK and getattr(e, "url", None):
+            return f"<a href='{escape(e.url)}'>"
+        if t == MessageEntityType.TEXT_MENTION and getattr(e, "user", None):
+            return f"<a href='tg://user?id={e.user.id}'>"
+        return ""
+
+    def close_tag(e):
+        t = e.type
+        if t == MessageEntityType.BOLD:
+            return "</b>"
+        if t == MessageEntityType.ITALIC:
+            return "</i>"
+        if t == MessageEntityType.UNDERLINE:
+            return "</u>"
+        if t == MessageEntityType.STRIKETHROUGH:
+            return "</s>"
+        if t == MessageEntityType.SPOILER:
+            return "</span>"
+        if t == MessageEntityType.CODE:
+            return "</code>"
+        if t == MessageEntityType.PRE:
+            return "</pre>"
+        if t in (MessageEntityType.TEXT_LINK, MessageEntityType.TEXT_MENTION):
+            return "</a>"
+        return ""
+
+    # Sort opens by longer length first (outer first), closes by shorter first (inner first)
+    for k in opens:
+        opens[k].sort(key=lambda x: x.length, reverse=True)
+    for k in closes:
+        closes[k].sort(key=lambda x: x.length)
+
+    out = []
+    for i, ch in enumerate(text):
+        if i in closes:
+            for e in reversed(closes[i]):
+                out.append(close_tag(e))
+        if i in opens:
+            for e in opens[i]:
+                out.append(open_tag(e))
+        out.append(escape(ch))
+
+    # close any entities ending at len(text)
+    if len(text) in closes:
+        for e in reversed(closes[len(text)]):
+            out.append(close_tag(e))
+
+    return "".join(out)
+
+# ===============================
 # 📢 BROADCAST (OWNER ONLY) - FIXED
 # ===============================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,11 +889,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             src_entities = src_msg.entities or []
 
         # no shifting needed in reply mode
-        text_html = src_msg.parse_entities(as_html=True)
+        text_html = entities_to_html(src_msg)
 
     else:
 
-        text_html = src_msg.parse_entities(as_html=True)
+        text_html = entities_to_html(src_msg)
 
     # 4) build content FROM src_msg (important for media captions)
     content = {

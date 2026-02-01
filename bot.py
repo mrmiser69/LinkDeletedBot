@@ -7,6 +7,8 @@ import asyncio
 import contextlib
 from html import escape
 from telegram.ext import PreCheckoutQueryHandler
+import re
+from telegram.helpers import message_entities_to_html
 
 from telegram import (
     Update,
@@ -47,10 +49,16 @@ BOT_START_TIME = int(time.time())
 LINK_SPAM_CACHE = {
     # (chat_id, user_id): {
     #   "count": int,
-    #   "last_time": int
+    #   "last_time": int,
+    #   "mute_until": int (optional)
     # }
 }
 LINK_SPAM_CACHE_TTL = 7200  # 2 hours (recommend)
+BROADCAST_CMD_RE = re.compile(r"^/broadcast(?:@\w+)?(?:\s+|$)", re.IGNORECASE)
+LOG_RATE_CACHE = {}  # key -> last_time
+LOG_RATE_SECONDS = 60  # 1 minute
+ADMIN_VERIFY_CACHE = {}      # chat_id -> last_verify_time
+ADMIN_VERIFY_SECONDS = 300   # 5 minutes per chat (rate-limit safe)
 
 # ===============================
 # CONFIG
@@ -83,7 +91,8 @@ async def db_execute(query, params=None, fetch=False):
                 if fetch:
                     cols = [d.name for d in cur.description]
                     return [dict(zip(cols, r)) for r in cur.fetchall()]
-                conn.commit()
+                else:
+                    conn.commit()
 
     return await loop.run_in_executor(None, _run)
 
@@ -461,11 +470,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
-# LINK + MUTE CONFIG
+# is group admin cached db
 # ===============================
-LINK_LIMIT = 3          # links before mute
-MUTE_SECONDS = 600      # 10 minutes
-SPAM_RESET_SECONDS = 3600  # 1 hour
+async def is_group_admin_cached_db(chat_id: int) -> bool:
+    rows = await db_execute(
+        "SELECT is_admin_cached FROM groups WHERE group_id=%s",
+        (chat_id,),
+        fetch=True
+    )
+    return bool(rows and rows[0].get("is_admin_cached"))
+
+# ===============================
+# Rate Limited log
+# ===============================
+def rate_limited_log(key: str, message: str):
+    now = int(time.time())
+    last = LOG_RATE_CACHE.get(key, 0)
+    if now - last >= LOG_RATE_SECONDS:
+        LOG_RATE_CACHE[key] = now
+        print(message)
 
 # ===============================
 # AUTO LINK DELETE (OPTION A CORE)
@@ -477,9 +500,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not chat or not msg or not user:
         return
+    
     if chat.type not in ("group", "supergroup"):
         return
-
+    
+    if user.id == OWNER_ID:
+        return
+    
     chat_id = chat.id
     user_id = user.id
 
@@ -510,7 +537,18 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===============================
     # 🔐 STEP 2: BOT ADMIN CHECK (ONLY IF LINK)
     # ===============================
+    # STEP 2: quick allow via DB cache OR RAM cache
     if chat_id not in BOT_ADMIN_CACHE:
+        try:
+            if await asyncio.wait_for(is_group_admin_cached_db(chat_id), timeout=1.5):
+                BOT_ADMIN_CACHE.add(chat_id)
+            else:
+                return
+        except:
+            return
+
+    # ✅ STEP 2.5: ALWAYS self-heal verify (rate-limited)
+    if not await ensure_bot_admin_live(chat_id, context):
         return
 
     # ===============================
@@ -525,16 +563,23 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await msg.delete()
     except BadRequest as e:
-        print("ℹ️ Delete skipped:", e)
+        rate_limited_log(
+            f"delete_skip_{chat_id}",
+            f"ℹ️ Delete skipped in {chat_id}: {e}"
+        )
         return
     except Exception as e:
-        print("❌ Delete failed:", e)
+        rate_limited_log(
+            f"delete_fail_{chat_id}",
+            f"❌ Delete failed in {chat_id}: {e}"
+        )
         return
 
     # 🔢 STEP 5: COUNT + MUTE FIRST (IMPORTANT FIX)
-    muted = await link_spam_control(chat_id, user_id, context)
+    muted = await link_spam_control(chat_id, chat.type, user_id, context)
 
-    user_mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+    name = escape(user.first_name or "User")
+    user_mention = f'<a href="tg://user?id={user.id}">{name}</a>'
 
     # ⚠️ ONLY WARN IF NOT MUTED
     if not muted:
@@ -561,33 +606,60 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ===============================
-# LINK COUNT + MUTE (RAM-FIRST ⭐ 90+)
+# LINK + MUTE CONFIG
 # ===============================
-async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+LINK_LIMIT = 3          # links before mute
+MUTE_SECONDS = 600      # 10 minutes
+SPAM_RESET_SECONDS = 3600  # 1 hour
+
+# ===============================
+# Upsert Link Spam
+# ===============================
+async def upsert_link_spam(chat_id: int, user_id: int, count: int, last_time: int):
+    await db_execute(
+        """
+        INSERT INTO link_spam (chat_id, user_id, count, last_time)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (chat_id, user_id)
+        DO UPDATE SET count = EXCLUDED.count, last_time = EXCLUDED.last_time
+        """,
+        (chat_id, user_id, count, last_time)
+    )
+
+# ===============================
+# LINK COUNT + MUTE (RAM-FIRST) ✅ FIXED supergroup check
+# ===============================
+async def link_spam_control(
+    chat_id: int,
+    chat_type: str,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE
+) -> bool:
     now = int(time.time())
     key = (chat_id, user_id)
 
-    # -------------------------------------------------
-    # 🔥 STEP 1: RAM-FIRST CHECK (NO DB, NO API)
-    # -------------------------------------------------
+    # 🔥 STEP 1: RAM-FIRST
     data = LINK_SPAM_CACHE.get(key)
 
+    # ✅ NEW: if already muted (keep state), return True
     if data:
-        # ⛔ still muted window → nothing to do
+        mute_until = data.get("mute_until", 0)
+        if mute_until and now < mute_until:
+            return True
+
+        # still muted window by last_time (legacy safety) → do nothing
         if now - data["last_time"] < MUTE_SECONDS:
             return False
 
-        # 🔢 count logic
+        # reset or increment count
         if now - data["last_time"] > SPAM_RESET_SECONDS:
             data["count"] = 1
         else:
             data["count"] += 1
-
         data["last_time"] = now
+
     else:
-        # -------------------------------------------------
-        # 🐢 STEP 2: FALLBACK DB (FIRST TIME ONLY)
-        # -------------------------------------------------
+        # 🐢 STEP 2: DB fallback (first time only)
         try:
             rows = await asyncio.wait_for(
                 db_execute(
@@ -606,49 +678,35 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
 
         if rows:
             last_time = rows[0]["last_time"]
-
             if now - last_time < MUTE_SECONDS:
                 return False
-
-            count = (
-                1
-                if now - last_time > SPAM_RESET_SECONDS
-                else rows[0]["count"] + 1
-            )
+            count = 1 if now - last_time > SPAM_RESET_SECONDS else rows[0]["count"] + 1
         else:
             count = 1
 
-        data = {
-            "count": count,
-            "last_time": now
-        }
+        data = {"count": count, "last_time": now}
         LINK_SPAM_CACHE[key] = data
 
-    # -------------------------------------------------
-    # 🔢 STEP 3: LIMIT NOT REACHED
-    # -------------------------------------------------
+    # 🔢 STEP 3: limit not reached -> persist to DB (so restart won't reset)
     if data["count"] < LINK_LIMIT:
+        context.application.create_task(
+            upsert_link_spam(chat_id, user_id, data["count"], data["last_time"])
+        )
         return False
 
-    # -------------------------------------------------
-    # 🔒 STEP 4: SUPERGROUP ONLY (NO API)
-    # -------------------------------------------------
-    if chat_id > 0:  # normal group → skip mute
+    # ✅ STEP 4: SUPERGROUP ONLY (CORRECT)
+    if chat_type != "supergroup":
         return False
 
-    # -------------------------------------------------
-    # 👮 STEP 5: BOT PERMISSION CHECK
-    # -------------------------------------------------
+    # 👮 STEP 5: bot permission check
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if not me.can_restrict_members:
+        if not getattr(me, "can_restrict_members", False):
             return False
     except:
         return False
 
-    # -------------------------------------------------
-    # 🔇 STEP 6: MUTE USER
-    # -------------------------------------------------
+    # 🔇 STEP 6: mute
     try:
         await context.bot.restrict_chat_member(
             chat_id,
@@ -659,11 +717,14 @@ async def link_spam_control(chat_id: int, user_id: int, context: ContextTypes.DE
     except:
         return False
 
-    # -------------------------------------------------
-    # 🧹 STEP 7: CLEANUP (RAM + DB ASYNC)
-    # -------------------------------------------------
-    LINK_SPAM_CACHE.pop(key, None)
+    # ✅ NEW: Keep mute state in RAM so it doesn't reset
+    LINK_SPAM_CACHE[key] = {
+        "count": data.get("count", LINK_LIMIT),
+        "last_time": now,
+        "mute_until": now + MUTE_SECONDS
+    }
 
+    # DB clean (optional)
     context.application.create_task(
         db_execute(
             "DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s",
@@ -689,32 +750,78 @@ async def cleanup_link_spam_cache(context: ContextTypes.DEFAULT_TYPE):
         print(f"🧹 RAM cache cleaned: {removed} entries")
 
 # ===============================
-# 📢 BROADCAST (OWNER ONLY)
+# 📢 BROADCAST (OWNER ONLY) - FIXED
 # ===============================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+    user = update.effective_user
+    if not user or user.id != OWNER_ID:
         return
 
     msg = update.effective_message
     if not msg:
         return
 
-    text = msg.text or msg.caption
-    if not text or not text.startswith("/broadcast"):
+    # 1) where command is typed
+    if msg.caption is not None:
+        raw_text = (msg.caption or "").strip()
+        cmd_entities = msg.caption_entities or []
+    else:
+        raw_text = (msg.text or "").strip()
+        cmd_entities = msg.entities or []
+
+    m = BROADCAST_CMD_RE.match(raw_text)
+    if not m:
         return
 
-    text = text.replace("/broadcast", "", 1).strip()
+    # 2) body after /broadcast
+    body_text = raw_text[m.end():].lstrip()
 
+    # 3) Reply broadcast support:
+    # If owner sends "/broadcast" with NO body and replies to a message,
+    # broadcast the replied message content (text/caption + media).
+    src_msg = msg
+    src_entities = cmd_entities
+
+    if (not body_text) and msg.reply_to_message:
+        src_msg = msg.reply_to_message
+
+        if src_msg.caption is not None:
+            body_text = (src_msg.caption or "").strip()
+            src_entities = src_msg.caption_entities or []
+        else:
+            body_text = (src_msg.text or "").strip()
+            src_entities = src_msg.entities or []
+
+        # no shifting needed in reply mode
+        text_html = message_entities_to_html(body_text, src_entities)
+
+    else:
+        # normal mode: shift entities after removing command prefix
+        shift = m.end()
+        new_entities = []
+        for e in (src_entities or []):
+            if e.offset + e.length <= shift:
+                continue
+            if e.offset >= shift:
+                e2 = e.copy()
+                e2.offset -= shift
+                new_entities.append(e2)
+            else:
+                # overlaps prefix -> drop (safe)
+                continue
+
+        text_html = message_entities_to_html(body_text, new_entities)
+
+    # 4) build content FROM src_msg (important for media captions)
     content = {
-        "text": text,
-        "photo": msg.photo[-1].file_id if msg.photo else None,
-        "video": msg.video.file_id if msg.video else None,
-        "audio": msg.audio.file_id if msg.audio else None,
-        "document": msg.document.file_id if msg.document else None,
+        "text": text_html or "",
+        "photo": src_msg.photo[-1].file_id if src_msg.photo else None,
+        "video": src_msg.video.file_id if src_msg.video else None,
+        "audio": src_msg.audio.file_id if src_msg.audio else None,
+        "document": src_msg.document.file_id if src_msg.document else None,
     }
 
-    if not any(v for v in content.values() if v):
+    if not any([content["text"], content["photo"], content["video"], content["audio"], content["document"]]):
         await msg.reply_text("❌ Broadcast လုပ်ရန် content မတွေ့ပါ")
         return
 
@@ -722,9 +829,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ CONFIRM", callback_data="broadcast_confirm"),
-        InlineKeyboardButton("❌ CANCEL", callback_data="broadcast_cancel")
+        InlineKeyboardButton("❌ CANCEL", callback_data="broadcast_cancel"),
     ]])
-
     await msg.reply_text(
         "📢 <b>Broadcast Confirm လုပ်ပါ</b>",
         parse_mode="HTML",
@@ -736,6 +842,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
+    u = update.effective_user
+    if not u or u.id != OWNER_ID:
+        # ✅ silent: no alert, no edit
+        await query.answer()
+        return
+
     await query.answer()
 
     if OWNER_ID not in PENDING_BROADCAST:
@@ -746,25 +861,13 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("👤 Users only", callback_data="bc_target_users")],
         [InlineKeyboardButton("👥 Groups only", callback_data="bc_target_groups")],
         [InlineKeyboardButton("👥👤 Users + Groups", callback_data="bc_target_all")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")],
     ])
-
     await query.edit_message_text(
         "📢 <b>Broadcast Target ကိုရွေးပါ</b>",
         parse_mode="HTML",
         reply_markup=keyboard
     )
-
-# ===============================
-# Progress Bar Helper 
-# ===============================
-def render_progress(done, total):
-    if total <= 0:
-        return "██████████ 100%"
-    percent = int((done / total) * 100)
-    blocks = min(10, percent // 10)
-    bar = "█" * blocks + "░" * (10 - blocks)
-    return f"{bar} {percent}%"
 
 # ===============================
 # update progress 
@@ -788,87 +891,148 @@ async def update_progress(msg, sent, total):
         pass
 
 # ===============================
-# Broadcast flood-safe 
+# Broadcast flood-safe (FIXED ✅)
 # ===============================
-async def safe_send(func, *args, **kwargs):
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, func, chat_id: int, *args, **kwargs):
+    """
+    Usage:
+        await safe_send(context, send_content, chat_id, data)
+
+    Returns Message or None.
+    """
     for _ in range(5):
         try:
-            return await func(*args, **kwargs)
+            return await func(context, chat_id, *args, **kwargs)
 
         except ChatMigrated as e:
-            # args = (context, chat_id, data) ဆိုတဲ့ pattern ဖြစ်နေလို့
+            new_chat_id = e.new_chat_id
             try:
-                context = args[0]
-                old_chat_id = args[1]
-                new_chat_id = e.new_chat_id
-
-                # DB update (groups table)
                 context.application.create_task(
-                    db_execute(
-                        "UPDATE groups SET group_id=%s WHERE group_id=%s",
-                        (new_chat_id, old_chat_id)
-                    )
+                    migrate_group_id_in_db(chat_id, new_chat_id)
                 )
-
-                # retry with new chat id
-                new_args = (args[0], new_chat_id, *args[2:])
-                args = new_args
-                continue
             except Exception:
-                return None
+                pass
+            
+            # update caches too
+            BOT_ADMIN_CACHE.discard(chat_id)
+            USER_ADMIN_CACHE.pop(chat_id, None)
+            REMINDER_MESSAGES.pop(chat_id, None)
+            
+            chat_id = new_chat_id
+            continue
 
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
 
         except (Forbidden, BadRequest):
+            # If this is a group broadcast target, mark as non-admin cached (self-heal)
+            try:
+                context.application.create_task(
+                    db_execute(
+                        """
+                        UPDATE groups
+                        SET is_admin_cached = FALSE,
+                            last_checked_at = %s
+                        WHERE group_id = %s
+                        """,
+                        (int(time.time()), chat_id)
+                    )
+                )
+            except Exception:
+                pass
+            
             return None
 
-    return None
+# ===============================
+# migrate group id in db
+# ===============================
+async def migrate_group_id_in_db(old_chat_id: int, new_chat_id: int):
+    """
+    ChatMigrated safe DB migration:
+    - copy old row -> new id (if new id already exists, do nothing)
+    - delete old row
+    """
+    try:
+        await db_execute(
+            """
+            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+            SELECT %s, is_admin_cached, last_checked_at
+            FROM groups
+            WHERE group_id = %s
+            ON CONFLICT (group_id) DO NOTHING;
+            """,
+            (new_chat_id, old_chat_id),
+        )
+    except Exception as e:
+        print("⚠️ migrate insert skip:", e)
+
+    try:
+        await db_execute(
+            "DELETE FROM groups WHERE group_id = %s",
+            (old_chat_id,),
+        )
+    except Exception as e:
+        print("⚠️ migrate delete skip:", e)
 
 # ===============================
 # BATCH DB READ (10k+ SAFE)
 # ===============================
-async def iter_db_ids(query, batch_size=500):
-    offset = 0
+async def iter_db_ids(table: str, id_col: str, where_sql: str = "", batch_size: int = 500):
+    """
+    Keyset pagination (fast for 10k+):
+    Example:
+      async for rows in iter_db_ids("users", "user_id"):
+      async for rows in iter_db_ids("groups", "group_id", "WHERE is_admin_cached = TRUE"):
+    """
+    last_id = None
     while True:
-        rows = await db_execute(
-            f"{query} LIMIT %s OFFSET %s",
-            (batch_size, offset),
-            fetch=True
-        )
+        if last_id is None:
+            q = f"SELECT {id_col} FROM {table} {where_sql} ORDER BY {id_col} LIMIT %s"
+            params = (batch_size,)
+        else:
+            q = f"SELECT {id_col} FROM {table} {where_sql} AND {id_col} > %s ORDER BY {id_col} LIMIT %s" \
+                if where_sql else \
+                f"SELECT {id_col} FROM {table} WHERE {id_col} > %s ORDER BY {id_col} LIMIT %s"
+            params = (last_id, batch_size)
+
+        rows = await db_execute(q, params, fetch=True)
         if not rows:
             break
+
+        last_id = rows[-1][id_col]
         yield rows
-        offset += batch_size
 
 # ===============================
 # Broadcast Target Handler
 # ===============================
 async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
+    u = update.effective_user
+    if not u or u.id != OWNER_ID:
+        # ✅ silent
+        await query.answer()
+        return
+
     await query.answer()
 
-    data = PENDING_BROADCAST.pop(OWNER_ID, None)
+    data = PENDING_BROADCAST.get(OWNER_ID)
     if not data:
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
         return
 
-    target_type = query.data  # bc_target_users / bc_target_groups / bc_target_all
-
+    target_type = query.data
     progress_msg = await query.edit_message_text(
         "📢 <b>Broadcasting...</b>\n\n⏳ Progress: 0%",
         parse_mode="HTML"
     )
-    
-    sent = 0
-    start_time = time.time()
-    
-    total = 0
 
+    total = 0
     if target_type in ("bc_target_users", "bc_target_all"):
         rows = await db_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
         total += rows[0]["c"] if rows else 0
-
     if target_type in ("bc_target_groups", "bc_target_all"):
         rows = await db_execute(
             "SELECT COUNT(*) AS c FROM groups WHERE is_admin_cached = TRUE",
@@ -876,35 +1040,43 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
         )
         total += rows[0]["c"] if rows else 0
 
+    sent = 0
+    attempted = 0
+    start_time = time.time()
+
     async def send_batch(ids):
-        nonlocal sent
+        nonlocal sent, attempted
         for cid in ids:
-            await safe_send(send_content, context, cid, data)
-            sent += 1
+            attempted += 1
+            
+            res = await safe_send(context, send_content, cid, data)
+            if res:
+                sent += 1
+            
+            if attempted % 20 == 0:
+                await asyncio.sleep(0.05)
+            
+            if attempted % 50 == 0 or attempted == total:
+                await update_progress(progress_msg, attempted, total)
 
-            # 🔄 update every 50 messages (SAFE)
-            if sent % 50 == 0 or sent == total:
-                await update_progress(progress_msg, sent, total)
+    try:
+        if target_type in ("bc_target_users", "bc_target_all"):
+            async for rows in iter_db_ids("users", "user_id"):
+                await send_batch([r["user_id"] for r in rows])
 
-    # 👤 USERS
-    if target_type in ("bc_target_users", "bc_target_all"):
-        async for rows in iter_db_ids(
-            "SELECT user_id FROM users ORDER BY user_id"
-        ):
-            await send_batch([r["user_id"] for r in rows])
-
-    # 👥 GROUPS (ADMIN ONLY)
-    if target_type in ("bc_target_groups", "bc_target_all"):
-        async for rows in iter_db_ids(
-            "SELECT group_id FROM groups WHERE is_admin_cached = TRUE ORDER BY group_id"
-        ):
-            await send_batch([r["group_id"] for r in rows])
+        if target_type in ("bc_target_groups", "bc_target_all"):
+            async for rows in iter_db_ids("groups", "group_id", "WHERE is_admin_cached = TRUE"):
+                await send_batch([r["group_id"] for r in rows])
+    finally:
+        PENDING_BROADCAST.pop(OWNER_ID, None)
 
     elapsed = int(time.time() - start_time)
+    failed = attempted - sent
 
     await progress_msg.edit_text(
         "✅ <b>Broadcast Completed</b>\n\n"
         f"📨 Sent: <b>{sent}</b>\n"
+        f"❌ Failed: <b>{failed}</b>\n"
         f"⏱️ Time: <b>{elapsed // 60}m {elapsed % 60}s</b>",
         parse_mode="HTML"
     )
@@ -914,10 +1086,17 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
 # ===============================
 async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
+    u = update.effective_user
+    if not u or u.id != OWNER_ID:
+        # ✅ silent
+        await query.answer()
+        return
+
     await query.answer()
-
     PENDING_BROADCAST.pop(OWNER_ID, None)
-
     await query.edit_message_text("❌ Broadcast Cancel လုပ်လိုက်ပါပြီ")
 
 # ===============================
@@ -925,7 +1104,7 @@ async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT
 # ===============================
 async def send_content(context, chat_id, data):
     text = data.get("text") or ""
-
+    
     try:
         if data.get("photo"):
             return await context.bot.send_photo(
@@ -1268,6 +1447,72 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
 
 # ===============================
+# Self-heal
+# ===============================
+async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Self-heal:
+    - Telegram API နဲ့ အချိန်ကာလအလိုက် verify လုပ်မယ် (rate-limited)
+    - Bot admin မဟုတ်တော့ရင် caches cleanup + DB update(FALSE) + optional auto-leave schedule
+    """
+    now = int(time.time())
+
+    last = ADMIN_VERIFY_CACHE.get(chat_id, 0)
+    if now - last < ADMIN_VERIFY_SECONDS:
+        # recently verified
+        return chat_id in BOT_ADMIN_CACHE
+
+    ADMIN_VERIFY_CACHE[chat_id] = now
+
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except Exception:
+        # cannot access -> treat as removed / no admin
+        BOT_ADMIN_CACHE.discard(chat_id)
+        USER_ADMIN_CACHE.pop(chat_id, None)
+        REMINDER_MESSAGES.pop(chat_id, None)
+        return False
+
+    # ✅ admin + can_delete_messages must be True
+    is_admin = me.status in ("administrator", "creator")
+    can_delete = getattr(me, "can_delete_messages", False)
+
+    if is_admin and can_delete:
+        BOT_ADMIN_CACHE.add(chat_id)
+        return True
+
+    # ❌ not admin or no delete permission -> self-heal cleanup
+    BOT_ADMIN_CACHE.discard(chat_id)
+    USER_ADMIN_CACHE.pop(chat_id, None)
+    REMINDER_MESSAGES.pop(chat_id, None)
+
+    # DB mark FALSE (non-blocking)
+    context.application.create_task(
+        db_execute(
+            """
+            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+            VALUES (%s, FALSE, %s)
+            ON CONFLICT (group_id)
+            DO UPDATE SET
+                is_admin_cached = FALSE,
+                last_checked_at = EXCLUDED.last_checked_at
+            """,
+            (chat_id, now)
+        )
+    )
+
+    # Optional: schedule auto-leave (60s later)
+    if context.job_queue:
+        context.job_queue.run_once(
+            leave_if_not_admin,
+            when=60,
+            data={"chat_id": chat_id},
+            name=f"auto_leave_{chat_id}"
+        )
+
+    return False
+
+# ===============================
 # USER ADMIN CHECK
 # ===============================
 async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1352,7 +1597,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 async def refresh_admin_cache(app):
     rows = await db_execute(
-        "SELECT group_id FROM groups",
+        "SELECT group_id FROM groups WHERE is_admin_cached = TRUE",
         fetch=True
     ) or []
 
@@ -1360,7 +1605,7 @@ async def refresh_admin_cache(app):
     verified = 0
     skipped = 0
 
-    now = time.time_ns()
+    now = int(time.time())
 
     for row in rows:
         gid = row["group_id"]
@@ -1400,7 +1645,7 @@ async def refresh_admin_cache(app):
             # ✅ API error -> DO NOT TOUCH DB (keeps old values)
             print(f"⚠️ Skip admin check for {gid}: {e}", flush=True)
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2) # safer for big bots
 
     print(f"✅ Admin cache verified: {verified}", flush=True)
     print(f"⚠️ Non-admin groups marked: {skipped}", flush=True)
@@ -1511,17 +1756,15 @@ def main():
         ),
         group=0
     )
-
+   
     # -------------------------------
     # Broadcast
     # -------------------------------
-    app.add_handler(
-        MessageHandler(
-            filters.User(OWNER_ID)
-            & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL),
-            broadcast
-        )
-    )
+    pattern = BROADCAST_CMD_RE.pattern
+
+    broadcast_filter = filters.User(OWNER_ID) & (filters.TEXT | filters.CAPTION) & filters.Regex(pattern)
+
+    app.add_handler(MessageHandler(broadcast_filter, broadcast))
 
     app.add_handler(CallbackQueryHandler(
         broadcast_confirm_handler,

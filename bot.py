@@ -8,7 +8,6 @@ import contextlib
 from html import escape
 from telegram.ext import PreCheckoutQueryHandler
 import re
-from telegram.helpers import message_entities_to_html
 
 from telegram import (
     Update,
@@ -793,7 +792,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             src_entities = src_msg.entities or []
 
         # no shifting needed in reply mode
-        text_html = message_entities_to_html(body_text, src_entities)
+        text_html = src_msg.parse_entities(as_html=True)
 
     else:
         # normal mode: shift entities after removing command prefix
@@ -810,7 +809,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # overlaps prefix -> drop (safe)
                 continue
 
-        text_html = message_entities_to_html(body_text, new_entities)
+        text_html = src_msg.parse_entities(as_html=True)
 
     # 4) build content FROM src_msg (important for media captions)
     content = {

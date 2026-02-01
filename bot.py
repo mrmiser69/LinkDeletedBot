@@ -750,161 +750,32 @@ async def cleanup_link_spam_cache(context: ContextTypes.DEFAULT_TYPE):
         print(f"🧹 RAM cache cleaned: {removed} entries")
 
 # ===============================
-# entities html
-# ===============================
-def entities_to_html(msg) -> str:
-    """
-    Convert message text/caption + entities to HTML safely (works across PTB versions).
-    Supports: bold, italic, underline, strikethrough, spoiler, code, pre, text_link, url, mention, text_mention.
-    """
-    text = msg.caption if msg.caption is not None else (msg.text or "")
-    if not text:
-        return ""
-
-    entities = []
-    if msg.caption is not None:
-        entities = list(msg.caption_entities or [])
-    else:
-        entities = list(msg.entities or [])
-
-    if not entities:
-        return escape(text)
-
-    # Build tags mapping
-    opens = {}
-    closes = {}
-    for e in entities:
-        start = e.offset
-        end = e.offset + e.length
-        opens.setdefault(start, []).append(e)
-        closes.setdefault(end, []).append(e)
-
-    # ensure proper nesting: close inner first, open outer first
-    def open_tag(e):
-        t = e.type
-        if t == MessageEntityType.BOLD:
-            return "<b>"
-        if t == MessageEntityType.ITALIC:
-            return "<i>"
-        if t == MessageEntityType.UNDERLINE:
-            return "<u>"
-        if t == MessageEntityType.STRIKETHROUGH:
-            return "<s>"
-        if t == MessageEntityType.SPOILER:
-            return '<span class="tg-spoiler">'
-        if t == MessageEntityType.CODE:
-            return "<code>"
-        if t == MessageEntityType.PRE:
-            return "<pre>"
-        if t == MessageEntityType.TEXT_LINK and getattr(e, "url", None):
-            return f"<a href='{escape(e.url)}'>"
-        if t == MessageEntityType.TEXT_MENTION and getattr(e, "user", None):
-            return f"<a href='tg://user?id={e.user.id}'>"
-        return ""
-
-    def close_tag(e):
-        t = e.type
-        if t == MessageEntityType.BOLD:
-            return "</b>"
-        if t == MessageEntityType.ITALIC:
-            return "</i>"
-        if t == MessageEntityType.UNDERLINE:
-            return "</u>"
-        if t == MessageEntityType.STRIKETHROUGH:
-            return "</s>"
-        if t == MessageEntityType.SPOILER:
-            return "</span>"
-        if t == MessageEntityType.CODE:
-            return "</code>"
-        if t == MessageEntityType.PRE:
-            return "</pre>"
-        if t in (MessageEntityType.TEXT_LINK, MessageEntityType.TEXT_MENTION):
-            return "</a>"
-        return ""
-
-    # Sort opens by longer length first (outer first), closes by shorter first (inner first)
-    for k in opens:
-        opens[k].sort(key=lambda x: x.length, reverse=True)
-    for k in closes:
-        closes[k].sort(key=lambda x: x.length)
-
-    out = []
-    for i, ch in enumerate(text):
-        if i in closes:
-            for e in reversed(closes[i]):
-                out.append(close_tag(e))
-        if i in opens:
-            for e in opens[i]:
-                out.append(open_tag(e))
-        out.append(escape(ch))
-
-    # close any entities ending at len(text)
-    if len(text) in closes:
-        for e in reversed(closes[len(text)]):
-            out.append(close_tag(e))
-
-    return "".join(out)
-
-# ===============================
-# 📢 BROADCAST (OWNER ONLY) - FIXED
+# 📢 BROADCAST (OWNER ONLY)
 # ===============================
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.id != OWNER_ID:
+
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
 
     msg = update.effective_message
     if not msg:
         return
 
-    # 1) where command is typed
-    if msg.caption is not None:
-        raw_text = (msg.caption or "").strip()
-        cmd_entities = msg.caption_entities or []
-    else:
-        raw_text = (msg.text or "").strip()
-        cmd_entities = msg.entities or []
-
-    m = BROADCAST_CMD_RE.match(raw_text)
-    if not m:
+    text = msg.text or msg.caption
+    if not text or not text.startswith("/broadcast"):
         return
 
-    # 2) body after /broadcast
-    body_text = raw_text[m.end():].lstrip()
+    text = text.replace("/broadcast", "", 1).strip()
 
-    # 3) Reply broadcast support:
-    # If owner sends "/broadcast" with NO body and replies to a message,
-    # broadcast the replied message content (text/caption + media).
-    src_msg = msg
-    src_entities = cmd_entities
-
-    if (not body_text) and msg.reply_to_message:
-        src_msg = msg.reply_to_message
-
-        if src_msg.caption is not None:
-            body_text = (src_msg.caption or "").strip()
-            src_entities = src_msg.caption_entities or []
-        else:
-            body_text = (src_msg.text or "").strip()
-            src_entities = src_msg.entities or []
-
-        # no shifting needed in reply mode
-        text_html = entities_to_html(src_msg)
-
-    else:
-
-        text_html = entities_to_html(src_msg)
-
-    # 4) build content FROM src_msg (important for media captions)
     content = {
-        "text": text_html or "",
-        "photo": src_msg.photo[-1].file_id if src_msg.photo else None,
-        "video": src_msg.video.file_id if src_msg.video else None,
-        "audio": src_msg.audio.file_id if src_msg.audio else None,
-        "document": src_msg.document.file_id if src_msg.document else None,
+        "text": text,
+        "photo": msg.photo[-1].file_id if msg.photo else None,
+        "video": msg.video.file_id if msg.video else None,
+        "audio": msg.audio.file_id if msg.audio else None,
+        "document": msg.document.file_id if msg.document else None,
     }
 
-    if not any([content["text"], content["photo"], content["video"], content["audio"], content["document"]]):
+    if not any(v for v in content.values() if v):
         await msg.reply_text("❌ Broadcast လုပ်ရန် content မတွေ့ပါ")
         return
 
@@ -912,8 +783,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ CONFIRM", callback_data="broadcast_confirm"),
-        InlineKeyboardButton("❌ CANCEL", callback_data="broadcast_cancel"),
+        InlineKeyboardButton("❌ CANCEL", callback_data="broadcast_cancel")
     ]])
+
     await msg.reply_text(
         "📢 <b>Broadcast Confirm လုပ်ပါ</b>",
         parse_mode="HTML",
@@ -925,15 +797,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===============================
 async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
-
-    u = update.effective_user
-    if not u or u.id != OWNER_ID:
-        # ✅ silent: no alert, no edit
-        await query.answer()
-        return
-
     await query.answer()
 
     if OWNER_ID not in PENDING_BROADCAST:
@@ -944,13 +807,25 @@ async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("👤 Users only", callback_data="bc_target_users")],
         [InlineKeyboardButton("👥 Groups only", callback_data="bc_target_groups")],
         [InlineKeyboardButton("👥👤 Users + Groups", callback_data="bc_target_all")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
     ])
+
     await query.edit_message_text(
         "📢 <b>Broadcast Target ကိုရွေးပါ</b>",
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
+# ===============================
+# Progress Bar Helper 
+# ===============================
+def render_progress(done, total):
+    if total <= 0:
+        return "██████████ 100%"
+    percent = int((done / total) * 100)
+    blocks = min(10, percent // 10)
+    bar = "█" * blocks + "░" * (10 - blocks)
+    return f"{bar} {percent}%"
 
 # ===============================
 # update progress 
@@ -974,148 +849,87 @@ async def update_progress(msg, sent, total):
         pass
 
 # ===============================
-# Broadcast flood-safe (FIXED ✅)
+# Broadcast flood-safe 
 # ===============================
-async def safe_send(context: ContextTypes.DEFAULT_TYPE, func, chat_id: int, *args, **kwargs):
-    """
-    Usage:
-        await safe_send(context, send_content, chat_id, data)
-
-    Returns Message or None.
-    """
+async def safe_send(func, *args, **kwargs):
     for _ in range(5):
         try:
-            return await func(context, chat_id, *args, **kwargs)
+            return await func(*args, **kwargs)
 
         except ChatMigrated as e:
-            new_chat_id = e.new_chat_id
+            # args = (context, chat_id, data) ဆိုတဲ့ pattern ဖြစ်နေလို့
             try:
-                context.application.create_task(
-                    migrate_group_id_in_db(chat_id, new_chat_id)
-                )
-            except Exception:
-                pass
-            
-            # update caches too
-            BOT_ADMIN_CACHE.discard(chat_id)
-            USER_ADMIN_CACHE.pop(chat_id, None)
-            REMINDER_MESSAGES.pop(chat_id, None)
-            
-            chat_id = new_chat_id
-            continue
+                context = args[0]
+                old_chat_id = args[1]
+                new_chat_id = e.new_chat_id
 
-        except RetryAfter as e:
-            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
-
-        except (Forbidden, BadRequest):
-            # If this is a group broadcast target, mark as non-admin cached (self-heal)
-            try:
+                # DB update (groups table)
                 context.application.create_task(
                     db_execute(
-                        """
-                        UPDATE groups
-                        SET is_admin_cached = FALSE,
-                            last_checked_at = %s
-                        WHERE group_id = %s
-                        """,
-                        (int(time.time()), chat_id)
+                        "UPDATE groups SET group_id=%s WHERE group_id=%s",
+                        (new_chat_id, old_chat_id)
                     )
                 )
+
+                # retry with new chat id
+                new_args = (args[0], new_chat_id, *args[2:])
+                args = new_args
+                continue
             except Exception:
-                pass
-            
+                return None
+
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+
+        except (Forbidden, BadRequest):
             return None
 
-# ===============================
-# migrate group id in db
-# ===============================
-async def migrate_group_id_in_db(old_chat_id: int, new_chat_id: int):
-    """
-    ChatMigrated safe DB migration:
-    - copy old row -> new id (if new id already exists, do nothing)
-    - delete old row
-    """
-    try:
-        await db_execute(
-            """
-            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
-            SELECT %s, is_admin_cached, last_checked_at
-            FROM groups
-            WHERE group_id = %s
-            ON CONFLICT (group_id) DO NOTHING;
-            """,
-            (new_chat_id, old_chat_id),
-        )
-    except Exception as e:
-        print("⚠️ migrate insert skip:", e)
-
-    try:
-        await db_execute(
-            "DELETE FROM groups WHERE group_id = %s",
-            (old_chat_id,),
-        )
-    except Exception as e:
-        print("⚠️ migrate delete skip:", e)
+    return None
 
 # ===============================
 # BATCH DB READ (10k+ SAFE)
 # ===============================
-async def iter_db_ids(table: str, id_col: str, where_sql: str = "", batch_size: int = 500):
-    """
-    Keyset pagination (fast for 10k+):
-    Example:
-      async for rows in iter_db_ids("users", "user_id"):
-      async for rows in iter_db_ids("groups", "group_id", "WHERE is_admin_cached = TRUE"):
-    """
-    last_id = None
+async def iter_db_ids(query, batch_size=500):
+    offset = 0
     while True:
-        if last_id is None:
-            q = f"SELECT {id_col} FROM {table} {where_sql} ORDER BY {id_col} LIMIT %s"
-            params = (batch_size,)
-        else:
-            q = f"SELECT {id_col} FROM {table} {where_sql} AND {id_col} > %s ORDER BY {id_col} LIMIT %s" \
-                if where_sql else \
-                f"SELECT {id_col} FROM {table} WHERE {id_col} > %s ORDER BY {id_col} LIMIT %s"
-            params = (last_id, batch_size)
-
-        rows = await db_execute(q, params, fetch=True)
+        rows = await db_execute(
+            f"{query} LIMIT %s OFFSET %s",
+            (batch_size, offset),
+            fetch=True
+        )
         if not rows:
             break
-
-        last_id = rows[-1][id_col]
         yield rows
+        offset += batch_size
 
 # ===============================
 # Broadcast Target Handler
 # ===============================
 async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
-
-    u = update.effective_user
-    if not u or u.id != OWNER_ID:
-        # ✅ silent
-        await query.answer()
-        return
-
     await query.answer()
 
-    data = PENDING_BROADCAST.get(OWNER_ID)
+    data = PENDING_BROADCAST.pop(OWNER_ID, None)
     if not data:
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
         return
 
-    target_type = query.data
+    target_type = query.data  # bc_target_users / bc_target_groups / bc_target_all
+
     progress_msg = await query.edit_message_text(
         "📢 <b>Broadcasting...</b>\n\n⏳ Progress: 0%",
         parse_mode="HTML"
     )
-
+    
+    sent = 0
+    start_time = time.time()
+    
     total = 0
+
     if target_type in ("bc_target_users", "bc_target_all"):
         rows = await db_execute("SELECT COUNT(*) AS c FROM users", fetch=True)
         total += rows[0]["c"] if rows else 0
+
     if target_type in ("bc_target_groups", "bc_target_all"):
         rows = await db_execute(
             "SELECT COUNT(*) AS c FROM groups WHERE is_admin_cached = TRUE",
@@ -1123,43 +937,35 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
         )
         total += rows[0]["c"] if rows else 0
 
-    sent = 0
-    attempted = 0
-    start_time = time.time()
-
     async def send_batch(ids):
-        nonlocal sent, attempted
+        nonlocal sent
         for cid in ids:
-            attempted += 1
-            
-            res = await safe_send(context, send_content, cid, data)
-            if res:
-                sent += 1
-            
-            if attempted % 20 == 0:
-                await asyncio.sleep(0.05)
-            
-            if attempted % 50 == 0 or attempted == total:
-                await update_progress(progress_msg, attempted, total)
+            await safe_send(send_content, context, cid, data)
+            sent += 1
 
-    try:
-        if target_type in ("bc_target_users", "bc_target_all"):
-            async for rows in iter_db_ids("users", "user_id"):
-                await send_batch([r["user_id"] for r in rows])
+            # 🔄 update every 50 messages (SAFE)
+            if sent % 50 == 0 or sent == total:
+                await update_progress(progress_msg, sent, total)
 
-        if target_type in ("bc_target_groups", "bc_target_all"):
-            async for rows in iter_db_ids("groups", "group_id", "WHERE is_admin_cached = TRUE"):
-                await send_batch([r["group_id"] for r in rows])
-    finally:
-        PENDING_BROADCAST.pop(OWNER_ID, None)
+    # 👤 USERS
+    if target_type in ("bc_target_users", "bc_target_all"):
+        async for rows in iter_db_ids(
+            "SELECT user_id FROM users ORDER BY user_id"
+        ):
+            await send_batch([r["user_id"] for r in rows])
+
+    # 👥 GROUPS (ADMIN ONLY)
+    if target_type in ("bc_target_groups", "bc_target_all"):
+        async for rows in iter_db_ids(
+            "SELECT group_id FROM groups WHERE is_admin_cached = TRUE ORDER BY group_id"
+        ):
+            await send_batch([r["group_id"] for r in rows])
 
     elapsed = int(time.time() - start_time)
-    failed = attempted - sent
 
     await progress_msg.edit_text(
         "✅ <b>Broadcast Completed</b>\n\n"
         f"📨 Sent: <b>{sent}</b>\n"
-        f"❌ Failed: <b>{failed}</b>\n"
         f"⏱️ Time: <b>{elapsed // 60}m {elapsed % 60}s</b>",
         parse_mode="HTML"
     )
@@ -1169,17 +975,10 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
 # ===============================
 async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
-
-    u = update.effective_user
-    if not u or u.id != OWNER_ID:
-        # ✅ silent
-        await query.answer()
-        return
-
     await query.answer()
+
     PENDING_BROADCAST.pop(OWNER_ID, None)
+
     await query.edit_message_text("❌ Broadcast Cancel လုပ်လိုက်ပါပြီ")
 
 # ===============================
@@ -1187,7 +986,7 @@ async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT
 # ===============================
 async def send_content(context, chat_id, data):
     text = data.get("text") or ""
-    
+
     try:
         if data.get("photo"):
             return await context.bot.send_photo(
@@ -1843,11 +1642,13 @@ def main():
     # -------------------------------
     # Broadcast
     # -------------------------------
-    pattern = BROADCAST_CMD_RE.pattern
-
-    broadcast_filter = filters.User(OWNER_ID) & (filters.TEXT | filters.CAPTION) & filters.Regex(pattern)
-
-    app.add_handler(MessageHandler(broadcast_filter, broadcast))
+    app.add_handler(
+        MessageHandler(
+            filters.User(OWNER_ID)
+            & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL),
+            broadcast
+        )
+    )
 
     app.add_handler(CallbackQueryHandler(
         broadcast_confirm_handler,

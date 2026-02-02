@@ -14,7 +14,6 @@ from telegram import (
     InlineKeyboardButton,
     ChatPermissions,
 )
-from telegram.constants import MessageEntityType
 from telegram.error import RetryAfter, Forbidden, BadRequest, ChatMigrated
 from telegram.ext import (
     ApplicationBuilder,
@@ -62,8 +61,6 @@ BOT_START_TIME = int(time.time())
 LINK_SPAM_CACHE = {}
 LINK_SPAM_CACHE_TTL = 7200  # 2 hours
 
-BROADCAST_CMD_RE = re.compile(r"^/broadcast(?:@\w+)?(?:\s+|$)", re.IGNORECASE)
-
 LOG_RATE_CACHE = {}
 LOG_RATE_SECONDS = 60
 
@@ -90,6 +87,16 @@ async def db_execute(query, params=None, fetch=False):
                 conn.commit()
 
     return await loop.run_in_executor(None, _run)
+
+# ✅ prevent "Task exception was never retrieved" when DB is down
+async def safe_db_execute(query, params=None, fetch=False):
+    try:
+        return await db_execute(query, params=params, fetch=fetch)
+    except Exception as e:
+        # keep bot running even if DB fails
+        rate_limited_log("db_error", f"❌ DB ERROR: {e}")
+        return None
+
 
 # ===============================
 # DB INIT / DB HELPERS
@@ -348,7 +355,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # PRIVATE
     if chat.type == "private":
         context.application.create_task(
-            db_execute(
+            safe_db_execute(
                 "INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",
                 (user.id,)
             )
@@ -687,12 +694,12 @@ async def link_spam_control(chat_id: int, chat_type: str, user_id: int, context:
         mute_until = data.get("mute_until", 0)
         if mute_until and now < mute_until:
             return True
-        if now - data["last_time"] < MUTE_SECONDS:
-            return False
-        if now - data["last_time"] > SPAM_RESET_SECONDS:
+        # ✅ ALWAYS count every new link attempt
+        last_time = int(data.get("last_time", 0))
+        if now - last_time > SPAM_RESET_SECONDS:
             data["count"] = 1
         else:
-            data["count"] += 1
+            data["count"] = int(data.get("count", 0)) + 1
         data["last_time"] = now
     else:
         try:
@@ -713,9 +720,8 @@ async def link_spam_control(chat_id: int, chat_type: str, user_id: int, context:
 
         if rows:
             last_time = rows[0]["last_time"]
-            if now - last_time < MUTE_SECONDS:
-                return False
-            count = 1 if now - last_time > SPAM_RESET_SECONDS else rows[0]["count"] + 1
+            # ✅ ALWAYS count every new link attempt (no early return)
+            count = 1 if now - last_time > SPAM_RESET_SECONDS else int(rows[0]["count"]) + 1
         else:
             count = 1
 
@@ -800,6 +806,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query or not update.effective_user or update.effective_user.id != OWNER_ID:
+        await query.answer()
+        return
     await query.answer()
     if OWNER_ID not in PENDING_BROADCAST:
         await query.edit_message_text("❌ Broadcast data မရှိပါ")
@@ -827,11 +836,22 @@ async def safe_send(func, *args, **kwargs):
                 context = args[0]
                 old_chat_id = args[1]
                 new_chat_id = e.new_chat_id
+                # ✅ safer: UPSERT new row + delete old row (avoid duplicates / stale)
                 context.application.create_task(
-                    db_execute(
-                        "UPDATE groups SET group_id=%s WHERE group_id=%s",
-                        (new_chat_id, old_chat_id)
+                    safe_db_execute(
+                        """
+                        INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+                        VALUES (%s, TRUE, %s)
+                        ON CONFLICT (group_id)
+                        DO UPDATE SET
+                          is_admin_cached = TRUE,
+                          last_checked_at = EXCLUDED.last_checked_at
+                        """,
+                        (new_chat_id, int(time.time()))
                     )
+                )
+                context.application.create_task(
+                    safe_db_execute("DELETE FROM groups WHERE group_id=%s", (old_chat_id,))
                 )
                 new_args = (args[0], new_chat_id, *args[2:])
                 args = new_args
@@ -860,6 +880,7 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
     )
 
     sent = 0
+    attempted = 0
     start_time = time.time()
 
     total = 0
@@ -874,12 +895,14 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
         total += rows[0]["c"] if rows else 0
 
     async def send_batch(ids):
-        nonlocal sent
+        nonlocal sent, attempted
         for cid in ids:
-            await safe_send(send_content, context, cid, data)
-            sent += 1
-            if sent % 50 == 0 or sent == total:
-                await update_progress(progress_msg, sent, total)
+            res = await safe_send(send_content, context, cid, data)
+            attempted += 1
+            if res:
+                sent += 1
+            if attempted % 50 == 0 or attempted == total:
+                await update_progress(progress_msg, attempted, total)
 
     if target_type in ("bc_target_users", "bc_target_all"):
         async for rows in iter_db_ids("SELECT user_id FROM users ORDER BY user_id"):
@@ -895,12 +918,16 @@ async def broadcast_target_handler(update: Update, context: ContextTypes.DEFAULT
     await progress_msg.edit_text(
         "✅ <b>Broadcast Completed</b>\n\n"
         f"📨 Sent: <b>{sent}</b>\n"
+        f"📦 Attempted: <b>{attempted}</b>\n"
         f"⏱️ Time: <b>{elapsed // 60}m {elapsed % 60}s</b>",
         parse_mode="HTML"
     )
 
 async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query or not update.effective_user or update.effective_user.id != OWNER_ID:
+        await query.answer()
+        return
     await query.answer()
     PENDING_BROADCAST.pop(OWNER_ID, None)
     await query.edit_message_text("❌ Broadcast Cancel လုပ်လိုက်ပါပြီ")

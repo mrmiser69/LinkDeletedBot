@@ -793,29 +793,54 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    text = msg.text or msg.caption
-    if not text or not text.startswith("/broadcast"):
+    raw = msg.text or msg.caption or ""
+    if not raw.startswith("/broadcast"):
         return
 
-    text = text.replace("/broadcast", "", 1).strip()
+    # mode decide
+    mode = "content"  # your current content-send mode (send_photo/send_video/etc)
+    if raw.startswith("/broadcast_fwd"):
+        mode = "forward"
+        raw = raw.replace("/broadcast_fwd", "", 1).strip()
+    elif raw.startswith("/broadcast_copy"):
+        mode = "copy"
+        raw = raw.replace("/broadcast_copy", "", 1).strip()
+    else:
+        raw = raw.replace("/broadcast", "", 1).strip()
+
+    # for forward/copy: use replied message as source (important)
+    src = msg.reply_to_message if msg.reply_to_message else msg
     content = {
-        "text": text,
-        "photo": msg.photo[-1].file_id if msg.photo else None,
-        "video": msg.video.file_id if msg.video else None,
-        "audio": msg.audio.file_id if msg.audio else None,
-        "document": msg.document.file_id if msg.document else None,
+        "mode": mode,
+        "text": raw,  # optional extra text/caption override
+        "photo": src.photo[-1].file_id if getattr(src, "photo", None) else None,
+        "video": src.video.file_id if getattr(src, "video", None) else None,
+        "audio": src.audio.file_id if getattr(src, "audio", None) else None,
+        "document": src.document.file_id if getattr(src, "document", None) else None,
+        # for forward/copy
+        "from_chat_id": src.chat.id,
+        "message_id": src.message_id,
     }
 
-    if not any(v for v in content.values() if v):
+    # ✅ allow text-only OR media
+    has_any_media = any([content["photo"], content["video"], content["audio"], content["document"]])
+    has_text = bool(content["text"])
+
+    # forward/copy must have a replied message (otherwise it just forwards the command)
+    if mode in ("forward", "copy") and not msg.reply_to_message:
+        await msg.reply_text("❌ /broadcast_fwd or /broadcast_copy ကို forward/copy လုပ်ချင်တဲ့ message ကို Reply ပြီး သုံးပါ။")
+        return
+
+    if not (has_text or has_any_media or mode in ("forward", "copy")):
         await msg.reply_text("❌ Broadcast လုပ်ရန် content မတွေ့ပါ")
         return
 
     PENDING_BROADCAST[OWNER_ID] = content
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ CONFIRM", callback_data="broadcast_confirm"),
         InlineKeyboardButton("❌ CANCEL", callback_data="broadcast_cancel")
     ]])
-
     await msg.reply_text(
         "📢 <b>Broadcast Confirm လုပ်ပါ</b>",
         parse_mode="HTML",
@@ -961,7 +986,62 @@ async def broadcast_cancel_handler(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text("❌ Broadcast Cancel လုပ်လိုက်ပါပြီ")
 
 async def send_content(context, chat_id, data):
-    # Prevent HTML parse errors in broadcast
+    mode = data.get("mode", "content")
+
+    # 1) forward/copy mode
+    if mode in ("forward", "copy"):
+        from_chat_id = data.get("from_chat_id")
+        message_id = data.get("message_id")
+        if not from_chat_id or not message_id:
+            return None
+        try:
+            override_raw = (data.get("text") or "").strip() 
+            override_text = escape(override_raw) if override_raw else ""
+            
+            if mode == "forward":
+                res = await context.bot.forward_message(
+                    chat_id=chat_id,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id
+                )
+            
+                # Optional: allow extra text with forward by sending a follow-up message
+                if override_text:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=override_text,
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                return res
+            else:
+                # IMPORTANT:
+                # - caption only works for media messages
+                # - text-only messages cannot accept caption (BadRequest)
+                if override_text:
+                    # safest: send override text first, then copy original message as-is
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=override_text,
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                return await context.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id
+                )
+        
+        except (Forbidden, BadRequest):
+            return None
+        except Exception:
+            return None
+
+    # 2) your existing "content" mode (send_photo/send_video/etc)
     text = escape(data.get("text") or "")
     try:
         if data.get("photo"):
@@ -999,9 +1079,9 @@ async def send_content(context, chat_id, data):
                 parse_mode="HTML"
             )
     except (Forbidden, BadRequest):
-        return
+        return None
     except Exception:
-        return
+        return None
 
 # ===============================
 # CHAT MEMBER EVENTS
@@ -1434,7 +1514,7 @@ def main():
     # Broadcast
     app.add_handler(
         MessageHandler(
-            filters.User(OWNER_ID) & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL),
+            filters.User(OWNER_ID) & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.Document.ALL),
             broadcast
         )
     )

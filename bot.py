@@ -46,6 +46,11 @@ LINK_LIMIT = 3
 MUTE_SECONDS = 600
 SPAM_RESET_SECONDS = 3600
 
+# Admin-list cache (performance: avoid per-user get_chat_member on every link)
+ADMIN_LIST_CACHE: dict[int, set[int]] = {}
+ADMIN_LIST_CACHE_TS: dict[int, int] = {}
+ADMIN_LIST_TTL = 60  # seconds (1 min)
+
 # ===============================
 # GLOBAL CACHES / STATE
 # ===============================
@@ -82,8 +87,11 @@ async def db_execute(query, params=None, fetch=False):
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 if fetch:
-                    cols = [d.name for d in cur.description]
-                    return [dict(zip(cols, r)) for r in cur.fetchall()]
+                    # cur.description can be None (e.g., some commands)
+                    cols = [d.name for d in (cur.description or [])]
+                    rows = cur.fetchall()
+                    conn.commit()
+                    return [dict(zip(cols, r)) for r in rows] if cols else rows
                 conn.commit()
 
     return await loop.run_in_executor(None, _run)
@@ -207,6 +215,24 @@ async def update_progress(msg, sent, total):
     except:
         pass
 
+async def get_admin_set(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fast path: fetch admin list once per TTL and reuse.
+    This avoids calling get_chat_member(chat_id, user_id) for every link message.
+    """
+    now = int(time.time())
+    ts = ADMIN_LIST_CACHE_TS.get(chat_id, 0)
+    if now - ts < ADMIN_LIST_TTL and chat_id in ADMIN_LIST_CACHE:
+        return ADMIN_LIST_CACHE[chat_id], True
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        s = {a.user.id for a in admins if a and getattr(a, "user", None)}
+        ADMIN_LIST_CACHE[chat_id] = s
+        ADMIN_LIST_CACHE_TS[chat_id] = now
+        return s, True
+    except Exception:
+        return ADMIN_LIST_CACHE.get(chat_id, set()), False
+
 # ===============================
 # ADMIN / PERMISSION HELPERS
 # ===============================
@@ -215,7 +241,7 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
         return True
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status in ("administrator", "creator"):
+        if me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False):
             BOT_ADMIN_CACHE.add(chat_id)
             return True
         return False
@@ -225,10 +251,11 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
 async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     now = int(time.time())
     last = ADMIN_VERIFY_CACHE.get(chat_id, 0)
+    # Throttle: within ADMIN_VERIFY_SECONDS, trust cache (True/False)
     if now - last < ADMIN_VERIFY_SECONDS:
         return chat_id in BOT_ADMIN_CACHE
-    ADMIN_VERIFY_CACHE[chat_id] = now
 
+    ADMIN_VERIFY_CACHE[chat_id] = now
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
     except ChatMigrated as e:
@@ -244,7 +271,13 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
             BOT_ADMIN_CACHE.add(new_id)
         USER_ADMIN_CACHE[new_id] = USER_ADMIN_CACHE.pop(chat_id, set())
         REMINDER_MESSAGES[new_id] = REMINDER_MESSAGES.pop(chat_id, [])
-
+        
+        # -------- ADMIN LIST cache migrate/clear --------
+        if chat_id in ADMIN_LIST_CACHE:
+            ADMIN_LIST_CACHE[new_id] = ADMIN_LIST_CACHE.pop(chat_id)
+        if chat_id in ADMIN_LIST_CACHE_TS:
+            ADMIN_LIST_CACHE_TS[new_id] = ADMIN_LIST_CACHE_TS.pop(chat_id)
+        
         # migrate LINK_SPAM_CACHE keys (chat_id, user_id)
         for (cid, uid), v in list(LINK_SPAM_CACHE.items()):
             if cid == chat_id:
@@ -424,7 +457,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not getattr(me, "can_send_messages", True):
                 return
 
-        if me.status in ("administrator", "creator"):
+        if me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False):
             try:
                 await bot.send_message(
                     chat.id,
@@ -663,11 +696,30 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_bot_admin_live(chat_id, context):
         return
 
-    if await is_user_admin(chat_id, user_id, context):
+    # ✅ FAST ADMIN SKIP (no per-user get_chat_member spam)
+    admin_set, ok = await get_admin_set(chat_id, context)
+    if user_id in admin_set:
         return
+    # ✅ SAFETY: if admin list couldn't be refreshed (API fail),
+    # confirm this user only (prevents deleting admins/creator by mistake)
+    if not ok:
+        try:
+            if await is_user_admin(chat_id, user_id, context):
+                return
+        except Exception:
+            return
 
+    # delete (handle rate limit better)
     try:
         await msg.delete()
+    except RetryAfter as e:
+        # Telegram rate limit: wait then retry once
+        try:
+            await asyncio.sleep(e.retry_after)
+            await msg.delete()
+        except Exception as e2:
+            rate_limited_log(f"delete_fail_{chat_id}", f"❌ Delete retry failed in {chat_id}: {e2}")
+            return    
     except BadRequest as e:
         rate_limited_log(f"delete_skip_{chat_id}", f"ℹ️ Delete skipped in {chat_id}: {e}")
         return
@@ -1095,7 +1147,7 @@ async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if me.status in ("administrator", "creator"):
+        if me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False):
             BOT_ADMIN_CACHE.add(chat_id)
             return
     except:
@@ -1133,6 +1185,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     USER_ADMIN_CACHE.pop(chat.id, None)
+    # reset admin list cache when bot role changes (helps correctness)
+    ADMIN_LIST_CACHE.pop(chat.id, None)
+    ADMIN_LIST_CACHE_TS.pop(chat.id, None)
+    # ✅ Clear verify throttle so new permission applies immediately
+    ADMIN_VERIFY_CACHE.pop(chat.id, None)
+
     old = update.my_chat_member.old_chat_member
     new = update.my_chat_member.new_chat_member
     if not old or not new:
@@ -1248,7 +1306,7 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
         REMINDER_MESSAGES.pop(chat_id, None)
         return
 
-    if me.status in ("administrator", "creator"):
+    if me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False):
         BOT_ADMIN_CACHE.add(chat_id)
         clear_reminders(context, chat_id)
         return
@@ -1296,6 +1354,8 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     BOT_ADMIN_CACHE.discard(chat_id)
     USER_ADMIN_CACHE.pop(chat_id, None)
+    ADMIN_LIST_CACHE.pop(chat_id, None)
+    ADMIN_LIST_CACHE_TS.pop(chat_id, None)
 
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -1394,6 +1454,12 @@ async def refresh_admin_cache(app):
                 BOT_ADMIN_CACHE.add(new_id)
             USER_ADMIN_CACHE[new_id] = USER_ADMIN_CACHE.pop(gid, set())
             REMINDER_MESSAGES[new_id] = REMINDER_MESSAGES.pop(gid, [])
+            # ✅ ALSO migrate/clear admin-list cache (consistency)
+            if gid in ADMIN_LIST_CACHE:
+                ADMIN_LIST_CACHE[new_id] = ADMIN_LIST_CACHE.pop(gid)
+            if gid in ADMIN_LIST_CACHE_TS:
+                ADMIN_LIST_CACHE_TS[new_id] = ADMIN_LIST_CACHE_TS.pop(gid)
+                        
             for (cid, uid), v in list(LINK_SPAM_CACHE.items()):
                 if cid == gid:
                     LINK_SPAM_CACHE[(new_id, uid)] = v
@@ -1505,9 +1571,16 @@ def main():
     # Chat member
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # Auto link delete
+    # Auto link delete (OPTIMIZED: only run handler when message likely contains links)
+    link_filters = (
+        filters.Entity("url")
+        | filters.Entity("text_link")
+        | filters.CaptionEntity("url")
+        | filters.CaptionEntity("text_link")
+        | filters.Regex(r"(https?://|t\.me/)")
+    )
     app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP, auto_delete_links),
+        MessageHandler((filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP) & link_filters, auto_delete_links),
         group=0
     )
 

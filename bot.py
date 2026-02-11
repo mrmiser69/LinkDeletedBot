@@ -76,6 +76,7 @@ ADMIN_VERIFY_SECONDS = 60
 # DB POOL + DB EXEC
 # ===============================
 pool = None
+DB_READY = False
 
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
@@ -98,6 +99,9 @@ async def db_execute(query, params=None, fetch=False):
 
 # ✅ prevent "Task exception was never retrieved" when DB is down
 async def safe_db_execute(query, params=None, fetch=False):
+    # If DB is not ready, don't even try (avoid log spam + overhead)
+    if pool is None or not DB_READY:
+        return None
     try:
         return await db_execute(query, params=params, fetch=fetch)
     except Exception as e:
@@ -105,24 +109,26 @@ async def safe_db_execute(query, params=None, fetch=False):
         rate_limited_log("db_error", f"❌ DB ERROR: {e}")
         return None
 
-
 # ===============================
 # DB INIT / DB HELPERS
 # ===============================
 async def init_db():
-    await db_execute("""
+    if pool is None:
+        return
+    
+    await safe_db_execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY
         )
     """)
-    await db_execute("""
+    await safe_db_execute("""
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGINT PRIMARY KEY,
             is_admin_cached BOOLEAN DEFAULT FALSE,
             last_checked_at BIGINT
         )
     """)
-    await db_execute("""
+    await safe_db_execute("""
         CREATE TABLE IF NOT EXISTS link_spam (
             chat_id BIGINT,
             user_id BIGINT,
@@ -432,7 +438,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     url=f"https://t.me/{bot_username}?startgroup=true"
                 )
             ])
-        buttons.append([InlineKeyboardButton("💖 DONATE US 💖", callback_data="donate_menu")])
+        buttons.append([InlineKeyboardButton("🤍 DONATE US 🤍", callback_data="donate_menu")])
         buttons.append([
             InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
             InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/MMTelegramBotss"),
@@ -510,7 +516,7 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "donate_menu":
         donate_text = (
-            "<b>💖 Support Us !</b>\n\n"
+            "<b>🤍 Support Us !</b>\n\n"
             "မင်းအတွက် အလုပ်ကောင်းကောင်းလုပ်နေတဲ့ Bot ကို Support ပေးနိုင်ပါတယ်။\n\n"
             "<b>👇 အောက်ကနေ ရွေးပါ</b>"
         )
@@ -552,7 +558,7 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     url=f"https://t.me/{bot_username}?startgroup=true"
                 )
             ])
-        buttons.append([InlineKeyboardButton("💖 DONATE US 💖", callback_data="donate_menu")])
+        buttons.append([InlineKeyboardButton("🤍 DONATE US 🤍", callback_data="donate_menu")])
         buttons.append([
             InlineKeyboardButton("👨‍💻 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://user?id=5942810488"),
             InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/MMTelegramBotss"),
@@ -674,22 +680,13 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     user_id = user.id
 
-    has_link = False
-    entities = []
-    if msg.entities:
-        entities.extend(msg.entities)
-    if msg.caption_entities:
-        entities.extend(msg.caption_entities)
-    for e in entities:
-        if e.type in ("url", "text_link"):
-            has_link = True
-            break
-
+    # link_filters already ensured "likely contains link"
+    # Keep a tiny extra safety check only for plain text patterns
     text = (msg.text or msg.caption or "").lower()
-    if "http://" in text or "https://" in text or "t.me/" in text:
-        has_link = True
-    if not has_link:
-        return
+    if not ("http://" in text or "https://" in text or "t.me/" in text):
+        # if Telegram entity-based link, handler is already filtered in main()
+        # so we can still proceed; no return needed
+        pass
 
     # ✅ BOT ADMIN CHECK (SOURCE OF TRUTH = Telegram API)
     # (No DB-cache gate here; DB is support-only)
@@ -1621,17 +1618,20 @@ def main():
                 kwargs={"prepare_threshold": None}
             )
             print("✅ DB pool created", flush=True)
+            global DB_READY
+            DB_READY = True
         except Exception as e:
-            print("❌ DB pool creation failed:", e, flush=True)
-            raise
+            print("⚠️ DB pool creation failed (BOT WILL RUN WITHOUT DB):", e, flush=True)
+            pool = None
+            DB_READY = False
 
+        # DB is optional now
         await init_db()
-        print("✅ DB init done", flush=True)
-
-        now = await refresh_admin_cache(app)
-        print("✅ Admin cache refreshed", flush=True)
-        
-        await purge_non_admin_groups_verified(now)
+        if DB_READY:
+            print("✅ DB init done", flush=True)
+            now = await refresh_admin_cache(app)
+            print("✅ Admin cache refreshed", flush=True)
+            await purge_non_admin_groups_verified(now)
         
         # 🔄 schedule RAM cache cleanup (every 30 minutes) ✅ CORRECT PLACE
         if app.job_queue:

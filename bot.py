@@ -50,7 +50,7 @@ SPAM_RESET_SECONDS = 3600
 # Admin-list cache (performance: avoid per-user get_chat_member on every link)
 ADMIN_LIST_CACHE: dict[int, set[int]] = {}
 ADMIN_LIST_CACHE_TS: dict[int, int] = {}
-ADMIN_LIST_TTL = 60  # seconds (1 min)
+ADMIN_LIST_TTL = 300  # seconds (5 min)
 
 # ===============================
 # GLOBAL CACHES / STATE
@@ -73,7 +73,9 @@ LOG_RATE_CACHE = {}
 LOG_RATE_SECONDS = 60
 
 ADMIN_VERIFY_CACHE = {}
-ADMIN_VERIFY_SECONDS = 60
+ADMIN_VERIFY_SECONDS = 300
+
+ADMIN_RECHECK_RUNNING: set[int] = set()
 
 # ===============================
 # DB POOL + DB EXEC
@@ -246,7 +248,20 @@ async def get_admin_set(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         ADMIN_LIST_CACHE_TS[chat_id] = now
         return s, True
     except Exception:
-        return ADMIN_LIST_CACHE.get(chat_id, set()), False
+        # stale cache ရှိရင် stale cache ကိုပဲသုံး
+        # delete speed မကျစေဖို့ API fail တောင် cached admins ကို continue သုံးမယ်
+        if chat_id in ADMIN_LIST_CACHE:
+            return ADMIN_LIST_CACHE[chat_id], True
+        return set(), False
+
+async def schedule_admin_recheck(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id in ADMIN_RECHECK_RUNNING:
+        return
+    ADMIN_RECHECK_RUNNING.add(chat_id)
+    try:
+        await ensure_bot_admin_live(chat_id, context)
+    finally:
+        ADMIN_RECHECK_RUNNING.discard(chat_id)
 
 # ===============================
 # ADMIN / PERMISSION HELPERS
@@ -690,17 +705,21 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # so we can still proceed; no return needed
         pass
 
-    # ✅ BOT ADMIN CHECK (SOURCE OF TRUTH = Telegram API)
-    # (No DB-cache gate here; DB is support-only)
-    if not await ensure_bot_admin_live(chat_id, context):
-        return
+    # ✅ FAST PATH:
+    # cache ထဲမှာ bot admin confirm ရှိရင် live API check မလုပ်ဘဲ ဆက်
+    # cache မရှိမှပဲ live verify fallback သုံး
+    if chat_id not in BOT_ADMIN_CACHE:
+        if not await ensure_bot_admin_live(chat_id, context):
+            return
 
-    # ✅ FAST ADMIN SKIP (no per-user get_chat_member spam)
+    # ✅ FAST ADMIN SKIP
+    # cached admin list ရှိရင် ချက်ချင်းသုံး
     admin_set, ok = await get_admin_set(chat_id, context)
     if user_id in admin_set:
         return
-    # ✅ SAFETY: if admin list couldn't be refreshed (API fail),
-    # confirm this user only (prevents deleting admins/creator by mistake)
+
+    # ✅ API fail + no cache ဆိုမှ single-user fallback
+    # stale cache ရှိရင် ok=True ပြန်လာလို့ ဒီ block မဝင်တော့ဘူး
     if not ok:
         try:
             if await is_user_admin(chat_id, user_id, context):
@@ -726,6 +745,10 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rate_limited_log(f"delete_fail_{chat_id}", f"❌ Delete failed in {chat_id}: {e}")
         return
 
+    # ✅ background re-check only (deduped)
+    # same group အတွက် verify task တစ်ခု run နေရင် ထပ်မတင်တော့ဘူး
+    context.application.create_task(schedule_admin_recheck(chat_id, context))
+   
     muted = await link_spam_control(chat_id, chat.type, user_id, context)
     name = escape(user.first_name or "User")
     user_mention = f'<a href="tg://user?id={user.id}">{name}</a>'
@@ -1638,6 +1661,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_ADMIN_CACHE.pop(chat_id, None)
     ADMIN_LIST_CACHE.pop(chat_id, None)
     ADMIN_LIST_CACHE_TS.pop(chat_id, None)
+    ADMIN_VERIFY_CACHE.pop(chat_id, None)
 
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -1832,7 +1856,7 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(32).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))

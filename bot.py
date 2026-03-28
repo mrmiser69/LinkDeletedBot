@@ -694,6 +694,17 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == OWNER_ID:
         return
 
+    # ✅ linked discussion channel messages ကို မဖျက်နဲ့
+    # channel post -> discussion group auto forward message
+    if getattr(msg, "is_automatic_forward", False):
+        return
+
+    # ✅ extra safety:
+    # sender_chat = linked channel / chat behalf message ဆိုရင် skip
+    sender_chat = getattr(msg, "sender_chat", None)
+    if sender_chat and getattr(sender_chat, "type", None) == "channel":
+        return
+
     chat_id = chat.id
     user_id = user.id
 
@@ -710,6 +721,26 @@ async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # cache မရှိမှပဲ live verify fallback သုံး
     if chat_id not in BOT_ADMIN_CACHE:
         if not await ensure_bot_admin_live(chat_id, context):
+            try:
+                me = await context.bot.get_me()
+                if not me.username:
+                    return
+                await context.bot.send_message(
+                    chat_id,
+                    "⚠️ <b>Link တွေကို Delete လုပ်ပေးနိုင်ရန်</b>\n\n"
+                    "🔗 Group ကို သန့်ရှင်းစေရန်\n"
+                    "⭐️ <b>ငါ့ကို Admin Permission ပေးပါ</b>\n\n"
+                    "✅ Admin ပေးလိုက်ရင် Link တွေကို Auto Delete လုပ်ပေးနိုင်ပါမယ်။",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "⭐ 𝗚𝗜𝗩𝗘 𝗔𝗗𝗠𝗜𝗡 𝗣𝗘𝗥𝗠𝗜𝗦𝗦𝗜𝗢𝗡",
+                            url=f"https://t.me/{me.username}?startgroup=true"
+                        )
+                    ]])
+                )
+            except Exception:
+                pass
             return
 
     # ✅ FAST ADMIN SKIP
